@@ -12,6 +12,11 @@ import type {
 import type { Gateway } from "./gateway.js";
 import type { Store } from "./store.js";
 import type { OAuthManager } from "./oauth.js";
+import {
+  getRequestLogStore,
+  type RequestLogFilter,
+  type RequestType,
+} from "./request-log.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -829,6 +834,121 @@ export function createApiRouter(
     }
   });
 
+  // ─── Request Logs ────────────────────────────────────────────────────────
+
+  const requestLog = getRequestLogStore();
+
+  /**
+   * GET /api/logs
+   * Get request logs with optional filtering.
+   *
+   * Query params:
+   * - type: "tool" | "resource" | "prompt"
+   * - serverId: filter by server ID
+   * - status: "pending" | "success" | "error"
+   * - query: search in method names
+   * - limit: max results (default 100)
+   * - offset: pagination offset
+   * - since: ISO timestamp or Unix ms
+   * - until: ISO timestamp or Unix ms
+   */
+  router.get("/logs", (req: Request, res: Response) => {
+    try {
+      const filter: RequestLogFilter = {};
+
+      if (req.query.type) {
+        filter.type = req.query.type as RequestType;
+      }
+      if (req.query.serverId) {
+        filter.serverId = req.query.serverId as string;
+      }
+      if (req.query.status) {
+        filter.status = req.query.status as "pending" | "success" | "error";
+      }
+      if (req.query.query) {
+        filter.query = req.query.query as string;
+      }
+      if (req.query.limit) {
+        filter.limit = parseInt(req.query.limit as string, 10);
+      } else {
+        filter.limit = 100; // Default limit
+      }
+      if (req.query.offset) {
+        filter.offset = parseInt(req.query.offset as string, 10);
+      }
+      if (req.query.since) {
+        filter.since = req.query.since as string;
+      }
+      if (req.query.until) {
+        filter.until = req.query.until as string;
+      }
+
+      const logs = requestLog.getAll(filter);
+      const total = requestLog.size();
+
+      res.json(
+        success({
+          logs,
+          total,
+          limit: filter.limit,
+          offset: filter.offset ?? 0,
+        })
+      );
+    } catch (err) {
+      console.error("[API] Error fetching logs:", err);
+      res.status(500).json(error("Failed to fetch logs."));
+    }
+  });
+
+  /**
+   * GET /api/logs/stats
+   * Get aggregated statistics about request logs.
+   */
+  router.get("/logs/stats", (_req: Request, res: Response) => {
+    try {
+      const stats = requestLog.getStats();
+      res.json(success(stats));
+    } catch (err) {
+      console.error("[API] Error fetching log stats:", err);
+      res.status(500).json(error("Failed to fetch log stats."));
+    }
+  });
+
+  /**
+   * GET /api/logs/:id
+   * Get a specific log entry by ID.
+   */
+  router.get("/logs/:id", (req: Request<IdParams>, res: Response) => {
+    try {
+      const { id } = req.params;
+      const log = requestLog.get(id);
+
+      if (!log) {
+        res.status(404).json(error(`Log entry "${id}" not found.`));
+        return;
+      }
+
+      res.json(success(log));
+    } catch (err) {
+      console.error("[API] Error fetching log:", err);
+      res.status(500).json(error("Failed to fetch log."));
+    }
+  });
+
+  /**
+   * DELETE /api/logs
+   * Clear all request logs.
+   */
+  router.delete("/logs", (_req: Request, res: Response) => {
+    try {
+      requestLog.clear();
+      res.json(success({ cleared: true }));
+    } catch (err) {
+      console.error("[API] Error clearing logs:", err);
+      res.status(500).json(error("Failed to clear logs."));
+    }
+  });
+
   // ─── Server-Sent Events (live status updates) ────────────────────────────
 
   /**
@@ -858,6 +978,17 @@ export function createApiRouter(
 
     gateway.on("event", onEvent);
 
+    // Listen for log events
+    const onLogStarted = (log: unknown) => {
+      res.write(`data: ${JSON.stringify({ type: "log:started", log })}\n\n`);
+    };
+    const onLogCompleted = (log: unknown) => {
+      res.write(`data: ${JSON.stringify({ type: "log:completed", log })}\n\n`);
+    };
+
+    requestLog.on("log:started", onLogStarted);
+    requestLog.on("log:completed", onLogCompleted);
+
     // Keep-alive ping every 30 seconds
     const keepAlive = setInterval(() => {
       res.write(": ping\n\n");
@@ -866,6 +997,8 @@ export function createApiRouter(
     // Cleanup on connection close
     req.on("close", () => {
       gateway.off("event", onEvent);
+      requestLog.off("log:started", onLogStarted);
+      requestLog.off("log:completed", onLogCompleted);
       clearInterval(keepAlive);
     });
   });

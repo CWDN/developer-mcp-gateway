@@ -2,6 +2,56 @@
 
 export type ServerTransport = "stdio" | "sse" | "streamable-http";
 
+export type RequestType = "tool" | "resource" | "prompt";
+
+export interface RequestLogEntry {
+  id: string;
+  timestamp: string;
+  type: RequestType;
+  method: string;
+  originalMethod?: string;
+  server: {
+    id: string;
+    name: string;
+  };
+  request: Record<string, unknown>;
+  response?: {
+    content: unknown;
+    isError?: boolean;
+  };
+  durationMs?: number;
+  sessionId?: string;
+  status: "pending" | "success" | "error";
+  errorMessage?: string;
+}
+
+export interface RequestLogFilter {
+  type?: RequestType;
+  serverId?: string;
+  status?: "pending" | "success" | "error";
+  query?: string;
+  limit?: number;
+  offset?: number;
+  since?: string | number;
+  until?: string | number;
+}
+
+export interface RequestLogStats {
+  total: number;
+  byType: Record<RequestType, number>;
+  byStatus: Record<string, number>;
+  byServer: Record<string, number>;
+  avgDurationMs: number;
+  errorRate: number;
+}
+
+export interface RequestLogsResponse {
+  logs: RequestLogEntry[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 export type ConnectionStatus =
   | "disconnected"
   | "connecting"
@@ -334,6 +384,40 @@ export async function getHealth(): Promise<HealthInfo> {
   return request<HealthInfo>("/health");
 }
 
+// ─── Request Logs ──────────────────────────────────────────────────────────────
+
+export async function getRequestLogs(
+  filter?: RequestLogFilter
+): Promise<RequestLogsResponse> {
+  const params = new URLSearchParams();
+
+  if (filter?.type) params.set("type", filter.type);
+  if (filter?.serverId) params.set("serverId", filter.serverId);
+  if (filter?.status) params.set("status", filter.status);
+  if (filter?.query) params.set("query", filter.query);
+  if (filter?.limit !== undefined) params.set("limit", String(filter.limit));
+  if (filter?.offset !== undefined) params.set("offset", String(filter.offset));
+  if (filter?.since !== undefined) params.set("since", String(filter.since));
+  if (filter?.until !== undefined) params.set("until", String(filter.until));
+
+  const queryString = params.toString();
+  const path = queryString ? `/logs?${queryString}` : "/logs";
+
+  return request<RequestLogsResponse>(path);
+}
+
+export async function getRequestLog(id: string): Promise<RequestLogEntry> {
+  return request<RequestLogEntry>(`/logs/${encodeURIComponent(id)}`);
+}
+
+export async function getRequestLogStats(): Promise<RequestLogStats> {
+  return request<RequestLogStats>("/logs/stats");
+}
+
+export async function clearRequestLogs(): Promise<{ cleared: boolean }> {
+  return request<{ cleared: boolean }>("/logs", { method: "DELETE" });
+}
+
 // ─── Server-Sent Events ────────────────────────────────────────────────────────
 
 export type GatewayEventData =
@@ -343,7 +427,9 @@ export type GatewayEventData =
   | { type: "server:removed"; serverId: string }
   | { type: "server:connected"; serverId: string }
   | { type: "server:disconnected"; serverId: string; error?: string }
-  | { type: "oauth:required"; serverId: string; authUrl: string };
+  | { type: "oauth:required"; serverId: string; authUrl: string }
+  | { type: "log:started"; log: RequestLogEntry }
+  | { type: "log:completed"; log: RequestLogEntry };
 
 export function subscribeToEvents(
   onEvent: (event: GatewayEventData) => void,

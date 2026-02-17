@@ -18,6 +18,7 @@ import ServerCard from "./components/ServerCard";
 import AddServerModal from "./components/AddServerModal";
 import EditServerModal from "./components/EditServerModal";
 import OAuthNotification from "./components/OAuthNotification";
+import LogViewer from "./components/LogViewer";
 import {
   Plus,
   RefreshCw,
@@ -27,6 +28,7 @@ import {
   MessageSquare,
   Activity,
   Loader2,
+  ScrollText,
 } from "lucide-react";
 
 type ModalState =
@@ -41,6 +43,7 @@ export default function App() {
   const [modal, setModal] = useState<ModalState>({ type: "none" });
   const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({});
   const [searchParams, setSearchParams] = useSearchParams();
+  const [showLogViewer, setShowLogViewer] = useState(false);
 
   // ─── OAuth callback notification ─────────────────────────────────────────
   const oauthStatus = searchParams.get("oauth");
@@ -280,6 +283,14 @@ export default function App() {
 
             <div className="flex items-center gap-3">
               <button
+                onClick={() => setShowLogViewer(true)}
+                className="btn-ghost flex items-center gap-1.5 text-sm"
+                title="View request logs"
+              >
+                <ScrollText className="w-4 h-4" />
+                <span className="hidden sm:inline">Logs</span>
+              </button>
+              <button
                 onClick={fetchServers}
                 className="btn-ghost flex items-center gap-1.5 text-sm"
                 title="Refresh servers"
@@ -405,6 +416,11 @@ export default function App() {
           onClose={() => setModal({ type: "none" })}
           onUpdated={handleServerUpdated}
         />
+      )}
+
+      {/* Log Viewer */}
+      {showLogViewer && (
+        <LogViewer onClose={() => setShowLogViewer(false)} />
       )}
     </div>
   );

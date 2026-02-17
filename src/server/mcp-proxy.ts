@@ -14,6 +14,7 @@ import type { Request, Response } from "express";
 import { Router } from "express";
 import type { Gateway } from "./gateway.js";
 import type { ToolInfo, ResourceInfo, PromptInfo } from "./types.js";
+import { getRequestLogStore, type RequestLogStore } from "./request-log.js";
 
 // ─── Constants ─────────────────────────────────────────────────────────────────
 
@@ -375,6 +376,7 @@ function handleGetServerTools(
 export function createMcpProxyRouter(gateway: Gateway): Router {
   const router = Router();
   const sessions = new Map<string, SessionEntry>();
+  const requestLog = getRequestLogStore();
 
   // ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -401,6 +403,14 @@ export function createMcpProxyRouter(gateway: Gateway): Router {
 
     if (!match) return undefined;
     return { serverId: match.serverId, originalName: match.originalName };
+  }
+
+  /**
+   * Get server info for a given server ID.
+   */
+  function getServerInfo(serverId: string): { id: string; name: string } {
+    const status = gateway.getServerStatus(serverId);
+    return { id: serverId, name: status?.name ?? serverId };
   }
 
   /**
@@ -461,7 +471,7 @@ export function createMcpProxyRouter(gateway: Gateway): Router {
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
 
-      // Handle gateway meta-tools
+      // Handle gateway meta-tools (not logged as they are internal)
       if (name === "gateway__search_tools") {
         return handleSearchTools(gateway, args ?? {});
       }
@@ -488,6 +498,15 @@ export function createMcpProxyRouter(gateway: Gateway): Router {
         };
       }
 
+      // Start logging the request
+      const logId = requestLog.start({
+        type: "tool",
+        method: name,
+        originalMethod: resolved.originalName,
+        server: getServerInfo(resolved.serverId),
+        request: (args ?? {}) as Record<string, unknown>,
+      });
+
       try {
         const result = await gateway.callTool(
           resolved.serverId,
@@ -495,14 +514,26 @@ export function createMcpProxyRouter(gateway: Gateway): Router {
           args ?? {}
         );
         const r = result as Record<string, unknown>;
-        return {
+        const response = {
           content: (r.content as Array<Record<string, unknown>>) ?? [
             { type: "text", text: JSON.stringify(result) },
           ],
           isError: r.isError as boolean | undefined,
         };
+
+        // Log the successful response
+        requestLog.complete(logId, {
+          content: response.content,
+          isError: response.isError,
+        });
+
+        return response;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+
+        // Log the error
+        requestLog.fail(logId, message);
+
         return {
           content: [{ type: "text" as const, text: `Error: ${message}` }],
           isError: true,
@@ -547,11 +578,31 @@ export function createMcpProxyRouter(gateway: Gateway): Router {
         );
       }
 
+      // Start logging the request
+      const logId = requestLog.start({
+        type: "resource",
+        method: uri,
+        server: getServerInfo(match.serverId),
+        request: { uri },
+      });
+
       try {
         const result = await gateway.readResource(match.serverId, uri);
-        return result as { contents: Array<Record<string, unknown>> };
+        const typedResult = result as { contents: Array<Record<string, unknown>> };
+
+        // Log the successful response
+        requestLog.complete(logId, {
+          content: typedResult.contents,
+          isError: false,
+        });
+
+        return typedResult;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+
+        // Log the error
+        requestLog.fail(logId, message);
+
         throw new McpError(
           ErrorCode.InternalError,
           `Failed to read resource "${uri}": ${message}`
@@ -612,18 +663,39 @@ export function createMcpProxyRouter(gateway: Gateway): Router {
         );
       }
 
+      // Start logging the request
+      const logId = requestLog.start({
+        type: "prompt",
+        method: name,
+        originalMethod: match.originalName,
+        server: getServerInfo(match.serverId),
+        request: (args ?? {}) as Record<string, unknown>,
+      });
+
       try {
         const result = await gateway.getPrompt(
           match.serverId,
           match.originalName,
           args as Record<string, string> | undefined
         );
-        return result as {
+        const typedResult = result as {
           description?: string;
           messages: Array<Record<string, unknown>>;
         };
+
+        // Log the successful response
+        requestLog.complete(logId, {
+          content: typedResult,
+          isError: false,
+        });
+
+        return typedResult;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+
+        // Log the error
+        requestLog.fail(logId, message);
+
         throw new McpError(
           ErrorCode.InternalError,
           `Failed to get prompt "${name}": ${message}`

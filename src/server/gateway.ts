@@ -37,6 +37,13 @@ const MAX_RECONNECT_ATTEMPTS = 5;
 const BASE_RECONNECT_DELAY_MS = 2000;
 const MAX_RECONNECT_DELAY_MS = 30000;
 
+/**
+ * Default timeout for tool/resource/prompt requests in milliseconds.
+ * The MCP SDK defaults to 60 seconds, but some operations (e.g., Jira API calls)
+ * can take longer. This sets a more generous default of 5 minutes.
+ */
+const DEFAULT_REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
 // ─── Gateway ───────────────────────────────────────────────────────────────────
 
 export class Gateway extends EventEmitter {
@@ -620,7 +627,11 @@ export class Gateway extends EventEmitter {
       );
     }
 
-    return managed.client.callTool({ name: toolName, arguments: args });
+    return managed.client.callTool(
+      { name: toolName, arguments: args },
+      undefined,
+      { timeout: DEFAULT_REQUEST_TIMEOUT_MS }
+    );
   }
 
   /**
@@ -635,10 +646,11 @@ export class Gateway extends EventEmitter {
       if (managed.status !== "connected" || !managed.client) continue;
       const hasTool = managed.tools.some((t) => t.name === toolName);
       if (hasTool) {
-        const result = await managed.client.callTool({
-          name: toolName,
-          arguments: args,
-        });
+        const result = await managed.client.callTool(
+          { name: toolName, arguments: args },
+          undefined,
+          { timeout: DEFAULT_REQUEST_TIMEOUT_MS }
+        );
         return { serverId: id, result };
       }
     }
@@ -666,7 +678,10 @@ export class Gateway extends EventEmitter {
       );
     }
 
-    return managed.client.readResource({ uri });
+    return managed.client.readResource(
+      { uri },
+      { timeout: DEFAULT_REQUEST_TIMEOUT_MS }
+    );
   }
 
   // ─── Prompt Retrieval ──────────────────────────────────────────────────────
@@ -689,7 +704,10 @@ export class Gateway extends EventEmitter {
       );
     }
 
-    return managed.client.getPrompt({ name, arguments: args });
+    return managed.client.getPrompt(
+      { name, arguments: args },
+      { timeout: DEFAULT_REQUEST_TIMEOUT_MS }
+    );
   }
 
   // ─── Status & Queries ─────────────────────────────────────────────────────
