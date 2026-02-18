@@ -8,6 +8,7 @@ import type {
   UpdateServerRequest,
   ApiResponse,
   OAuthConfig,
+  AuthConfig,
 } from "./types.js";
 import type { Gateway } from "./gateway.js";
 import type { Store } from "./store.js";
@@ -30,6 +31,49 @@ function error(message: string): ApiResponse {
 
 function now(): string {
   return new Date().toISOString();
+}
+
+/**
+ * Masks sensitive fields in an AuthConfig for API responses.
+ * Returns a sanitized copy of the auth config with secrets replaced by placeholders.
+ */
+function maskAuthConfig(auth: AuthConfig | undefined): AuthConfig | undefined {
+  if (!auth) return undefined;
+  
+  switch (auth.mode) {
+    case "none":
+      return auth;
+    
+    case "oauth":
+      return {
+        ...auth,
+        clientSecret: auth.clientSecret ? "••••••••" : undefined,
+      };
+    
+    case "bearer":
+      return {
+        ...auth,
+        token: "••••••••",
+      };
+    
+    case "api-key":
+      return {
+        ...auth,
+        key: "••••••••",
+      };
+    
+    case "custom":
+      // Mask all header values
+      return {
+        ...auth,
+        headers: Object.fromEntries(
+          Object.keys(auth.headers).map((key) => [key, "••••••••"])
+        ),
+      };
+    
+    default:
+      return auth;
+  }
 }
 
 // Route params types
@@ -64,19 +108,20 @@ export function createApiRouter(
       const servers = configs.map((config) => {
         const status = statuses.find((s) => s.id === config.id);
         const authStatus = oauthManager.getAuthStatus(config.id);
+        const remoteConfig = config.transport !== "stdio" ? (config as RemoteServerConfig) : null;
 
         return {
           ...config,
-          // Strip sensitive fields from OAuth config
-          oauth:
-            config.transport !== "stdio" && (config as RemoteServerConfig).oauth
-              ? {
-                  ...(config as RemoteServerConfig).oauth,
-                  clientSecret: (config as RemoteServerConfig).oauth?.clientSecret
-                    ? "••••••••"
-                    : undefined,
-                }
-              : undefined,
+          // Strip sensitive fields from auth configs
+          authConfig: remoteConfig ? maskAuthConfig(remoteConfig.auth) : undefined,
+          oauth: remoteConfig?.oauth
+            ? {
+                ...remoteConfig.oauth,
+                clientSecret: remoteConfig.oauth?.clientSecret
+                  ? "••••••••"
+                  : undefined,
+              }
+            : undefined,
           runtime: status
             ? {
                 status: status.status,
@@ -118,18 +163,19 @@ export function createApiRouter(
 
       const status = gateway.getServerStatus(id);
       const authStatus = oauthManager.getAuthStatus(id);
+      const remoteConfig = config.transport !== "stdio" ? (config as RemoteServerConfig) : null;
 
       const server = {
         ...config,
-        oauth:
-          config.transport !== "stdio" && (config as RemoteServerConfig).oauth
-            ? {
-                ...(config as RemoteServerConfig).oauth,
-                clientSecret: (config as RemoteServerConfig).oauth?.clientSecret
-                  ? "••••••••"
-                  : undefined,
-              }
-            : undefined,
+        authConfig: remoteConfig ? maskAuthConfig(remoteConfig.auth) : undefined,
+        oauth: remoteConfig?.oauth
+          ? {
+              ...remoteConfig.oauth,
+              clientSecret: remoteConfig.oauth?.clientSecret
+                ? "••••••••"
+                : undefined,
+            }
+          : undefined,
         runtime: status
           ? {
               status: status.status,
@@ -222,7 +268,7 @@ export function createApiRouter(
           return;
         }
 
-        // Validate OAuth config if provided
+        // Validate OAuth config if provided (legacy field)
         if (body.oauth) {
           const oauthErrors = validateOAuthConfig(body.oauth);
           if (oauthErrors.length > 0) {
@@ -242,6 +288,7 @@ export function createApiRouter(
           transport: body.transport,
           url: body.url,
           headers: body.headers,
+          auth: body.auth,
           oauth: body.oauth,
           createdAt: timestamp,
           updatedAt: timestamp,
@@ -267,21 +314,20 @@ export function createApiRouter(
       }
 
       const status = await gateway.registerServer(config);
+      const remoteConfig = config.transport !== "stdio" ? (config as RemoteServerConfig) : null;
 
       res.status(201).json(
         success({
           ...config,
-          oauth:
-            config.transport !== "stdio" &&
-            (config as RemoteServerConfig).oauth
-              ? {
-                  ...(config as RemoteServerConfig).oauth,
-                  clientSecret: (config as RemoteServerConfig).oauth
-                    ?.clientSecret
-                    ? "••••••••"
-                    : undefined,
-                }
-              : undefined,
+          authConfig: remoteConfig ? maskAuthConfig(remoteConfig.auth) : undefined,
+          oauth: remoteConfig?.oauth
+            ? {
+                ...remoteConfig.oauth,
+                clientSecret: remoteConfig.oauth?.clientSecret
+                  ? "••••••••"
+                  : undefined,
+              }
+            : undefined,
           runtime: {
             status: status.status,
             error: status.error,
@@ -341,7 +387,7 @@ export function createApiRouter(
           }
         }
 
-        // Validate OAuth config if provided
+        // Validate OAuth config if provided (legacy field)
         if (body.oauth && existing.transport !== "stdio") {
           const oauthErrors = validateOAuthConfig(
             body.oauth as unknown as Record<string, unknown>
@@ -380,25 +426,28 @@ export function createApiRouter(
             (updates as Partial<RemoteServerConfig>).oauth =
               body.oauth === null ? undefined : body.oauth;
           }
+          if (body.auth !== undefined) {
+            (updates as Partial<RemoteServerConfig>).auth =
+              body.auth === null ? undefined : body.auth;
+          }
         }
 
         const status = await gateway.updateServer(id, updates);
         const updatedConfig = store.getServer(id)!;
+        const remoteConfig = updatedConfig.transport !== "stdio" ? (updatedConfig as RemoteServerConfig) : null;
 
         res.json(
           success({
             ...updatedConfig,
-            oauth:
-              updatedConfig.transport !== "stdio" &&
-              (updatedConfig as RemoteServerConfig).oauth
-                ? {
-                    ...(updatedConfig as RemoteServerConfig).oauth,
-                    clientSecret: (updatedConfig as RemoteServerConfig)
-                      .oauth?.clientSecret
-                      ? "••••••••"
-                      : undefined,
-                  }
-                : undefined,
+            authConfig: remoteConfig ? maskAuthConfig(remoteConfig.auth) : undefined,
+            oauth: remoteConfig?.oauth
+              ? {
+                  ...remoteConfig.oauth,
+                  clientSecret: remoteConfig.oauth?.clientSecret
+                    ? "••••••••"
+                    : undefined,
+                }
+              : undefined,
             runtime: {
               status: status.status,
               error: status.error,
@@ -655,21 +704,36 @@ export function createApiRouter(
         }
 
         const remoteConfig = config as RemoteServerConfig;
-        if (!remoteConfig.oauth?.enabled) {
+        
+        // Check if OAuth is enabled (either via new auth config or legacy oauth field)
+        const hasOAuthAuth = remoteConfig.auth?.mode === "oauth";
+        const hasLegacyOAuth = remoteConfig.oauth?.enabled;
+        
+        if (!hasOAuthAuth && !hasLegacyOAuth) {
           res
             .status(400)
             .json(
               error(
-                "This server does not have OAuth enabled. Edit the server and enable OAuth first."
+                "This server does not have OAuth enabled. Edit the server and enable OAuth authentication first."
               )
             );
           return;
         }
 
+        // Build OAuth config from either new auth config or legacy oauth field
+        const oauthConfig = hasOAuthAuth
+          ? {
+              enabled: true,
+              clientId: remoteConfig.auth!.mode === "oauth" ? remoteConfig.auth!.clientId : undefined,
+              clientSecret: remoteConfig.auth!.mode === "oauth" ? remoteConfig.auth!.clientSecret : undefined,
+              scopes: remoteConfig.auth!.mode === "oauth" ? remoteConfig.auth!.scopes : undefined,
+            }
+          : remoteConfig.oauth!;
+
         // Capture the auth URL when the provider emits the redirect event.
         // We temporarily wrap the redirect callback to catch the URL.
         let capturedAuthUrl: string | undefined;
-        const provider = oauthManager.getProvider(id, remoteConfig.oauth);
+        const provider = oauthManager.getProvider(id, oauthConfig);
         const originalRedirect =
           provider.redirectToAuthorization.bind(provider);
 
@@ -682,7 +746,7 @@ export function createApiRouter(
           const result = await oauthManager.initiateAuth(
             id,
             remoteConfig.url,
-            remoteConfig.oauth
+            oauthConfig
           );
 
           // Restore original redirect function
@@ -1106,7 +1170,12 @@ export function createOAuthRouter(
         }
 
         const remoteConfig = config as RemoteServerConfig;
-        if (!remoteConfig.oauth?.enabled) {
+        
+        // Check if OAuth is enabled (either via new auth config or legacy oauth field)
+        const hasOAuthAuth = remoteConfig.auth?.mode === "oauth";
+        const hasLegacyOAuth = remoteConfig.oauth?.enabled;
+        
+        if (!hasOAuthAuth && !hasLegacyOAuth) {
           res.redirect(
             `/?oauth=error&serverId=${encodeURIComponent(
               serverId
@@ -1114,6 +1183,16 @@ export function createOAuthRouter(
           );
           return;
         }
+
+        // Build OAuth config from either new auth config or legacy oauth field
+        const oauthConfig = hasOAuthAuth
+          ? {
+              enabled: true,
+              clientId: remoteConfig.auth!.mode === "oauth" ? remoteConfig.auth!.clientId : undefined,
+              clientSecret: remoteConfig.auth!.mode === "oauth" ? remoteConfig.auth!.clientSecret : undefined,
+              scopes: remoteConfig.auth!.mode === "oauth" ? remoteConfig.auth!.scopes : undefined,
+            }
+          : remoteConfig.oauth!;
 
         // Exchange the authorization code for tokens using the MCP SDK
         console.log(
@@ -1124,7 +1203,7 @@ export function createOAuthRouter(
           serverId,
           remoteConfig.url,
           code,
-          remoteConfig.oauth
+          oauthConfig
         );
 
         console.log(

@@ -59,6 +59,70 @@ export type ConnectionStatus =
   | "error"
   | "awaiting_oauth";
 
+// ─── Authentication Configuration ──────────────────────────────────────────────
+
+/**
+ * Authentication mode for remote MCP servers.
+ */
+export type AuthMode = "none" | "oauth" | "bearer" | "api-key" | "custom";
+
+/**
+ * No authentication required.
+ */
+export interface NoAuthConfig {
+  mode: "none";
+}
+
+/**
+ * OAuth 2.0 authentication with auto-discovery.
+ */
+export interface OAuthAuthConfig {
+  mode: "oauth";
+  clientId?: string;
+  clientSecret?: string;
+  scopes?: string[];
+}
+
+/**
+ * Static bearer token authentication.
+ */
+export interface BearerAuthConfig {
+  mode: "bearer";
+  token: string;
+}
+
+/**
+ * API key authentication sent in a header.
+ */
+export interface ApiKeyAuthConfig {
+  mode: "api-key";
+  key: string;
+  headerName?: string;
+  headerPrefix?: string;
+}
+
+/**
+ * Fully custom header-based authentication.
+ */
+export interface CustomAuthConfig {
+  mode: "custom";
+  headers: Record<string, string>;
+}
+
+/**
+ * Union type for all authentication configurations.
+ */
+export type AuthConfig =
+  | NoAuthConfig
+  | OAuthAuthConfig
+  | BearerAuthConfig
+  | ApiKeyAuthConfig
+  | CustomAuthConfig;
+
+/**
+ * @deprecated Use AuthConfig with mode: "oauth" instead.
+ * Kept for backwards compatibility.
+ */
 export interface OAuthConfig {
   enabled: boolean;
   clientId?: string;
@@ -115,6 +179,9 @@ export interface ServerEntry {
   // Remote (sse / streamable-http)
   url?: string;
   headers?: Record<string, string>;
+  /** New flexible authentication configuration */
+  authConfig?: AuthConfig;
+  /** @deprecated Use authConfig instead */
   oauth?: OAuthConfig;
   // Runtime
   runtime: ServerRuntime;
@@ -161,6 +228,9 @@ export interface CreateRemoteServerPayload {
   transport: "sse" | "streamable-http";
   url: string;
   headers?: Record<string, string>;
+  /** New flexible authentication configuration */
+  auth?: AuthConfig;
+  /** @deprecated Use auth instead */
   oauth?: OAuthConfig;
   enabled?: boolean;
 }
@@ -188,6 +258,9 @@ export interface UpdateServerPayload {
   cwd?: string;
   url?: string;
   headers?: Record<string, string>;
+  /** New flexible authentication configuration (set to null to remove) */
+  auth?: AuthConfig | null;
+  /** @deprecated Use auth instead */
   oauth?: OAuthConfig | null;
 }
 

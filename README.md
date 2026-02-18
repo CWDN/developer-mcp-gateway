@@ -11,8 +11,10 @@ MCP Gateway acts as a centralized proxy and aggregator that connects to multiple
 - **Web UI** for registering, configuring, and monitoring MCP servers
 - **Local server support** via stdio transport (spawn child processes)
 - **Remote server support** via SSE and Streamable HTTP transports
+- **Flexible authentication** — supports multiple auth modes: OAuth 2.0 with auto-discovery, static bearer tokens, API keys, and custom headers
 - **Automatic OAuth 2.0 discovery** — just provide the server URL (e.g. `https://mcp.atlassian.com/v1/mcp`) and the gateway auto-discovers authorization endpoints via `.well-known/oauth-authorization-server` and `.well-known/oauth-protected-resource`
 - **PKCE + Dynamic Client Registration** — supports both pre-registered client IDs and RFC 7591 dynamic registration out of the box
+- **Bearer token support** — for APIs like GitHub Copilot MCP that require pre-authenticated tokens
 - **Live status updates** via Server-Sent Events (SSE)
 - **Auto-reconnection** with exponential backoff
 - **Persistent configuration** stored as JSON on disk
@@ -158,13 +160,25 @@ The gateway will spawn the process and connect via stdio.
    - **Custom Headers** (optional): Additional HTTP headers
 5. Click **"Add Server"**
 
+### Authentication Options for Remote Servers
+
+The gateway supports multiple authentication modes for remote MCP servers:
+
+| Mode | Use Case | Example |
+|------|----------|---------|
+| **None** | Public servers with no authentication | Development/testing servers |
+| **OAuth** | Servers implementing MCP OAuth 2.0 spec | Atlassian, compliant MCP servers |
+| **Bearer** | Pre-authenticated bearer tokens | GitHub Copilot MCP, custom APIs |
+| **API Key** | API key in a custom header | Third-party services |
+| **Custom** | Arbitrary authentication headers | Legacy or custom auth schemes |
+
 ### Adding a Remote Server with OAuth (e.g. Atlassian)
 
 For remote MCP servers that require OAuth 2.0 authentication (like `https://mcp.atlassian.com/v1/mcp`):
 
 1. Follow the steps above for adding a remote server
 2. Enter the server URL (e.g. `https://mcp.atlassian.com/v1/mcp`)
-3. Enable the **"OAuth Authentication"** checkbox
+3. In the **Authentication** section, select **OAuth**
 4. Optionally fill in:
    - **Client ID** — required if the server needs a pre-registered OAuth app; leave blank to attempt RFC 7591 Dynamic Client Registration automatically
    - **Client Secret** (optional) — only needed for confidential clients; public clients omit this
@@ -181,6 +195,43 @@ When you enable the server or click **Authenticate**, the gateway:
 5. Stores tokens securely and automatically refreshes them when they expire
 
 You can revoke tokens at any time from the server's detail panel.
+
+### Adding a Remote Server with Bearer Token (e.g. GitHub Copilot)
+
+For APIs that require a pre-authenticated bearer token (like `https://api.githubcopilot.com/mcp/`):
+
+1. Follow the steps above for adding a remote server
+2. Enter the server URL (e.g. `https://api.githubcopilot.com/mcp/`)
+3. In the **Authentication** section, select **Bearer**
+4. Enter your access token in the **Bearer Token** field
+5. Click **"Add Server"**
+
+The gateway will include the token as `Authorization: Bearer <token>` with every request.
+
+> **Note:** GitHub Copilot's MCP endpoint does not implement the standard OAuth discovery endpoints (`.well-known/oauth-authorization-server`), so OAuth auto-discovery won't work. Use the Bearer token mode instead with a valid GitHub Copilot access token.
+
+### Adding a Remote Server with API Key
+
+For services that use API key authentication:
+
+1. Follow the steps above for adding a remote server
+2. In the **Authentication** section, select **API Key**
+3. Fill in:
+   - **API Key** — your API key value
+   - **Header Name** (optional) — defaults to `X-API-Key`
+   - **Value Prefix** (optional) — e.g., `ApiKey ` to send `ApiKey your-key`
+4. Click **"Add Server"**
+
+### Adding a Remote Server with Custom Headers
+
+For custom authentication schemes:
+
+1. Follow the steps above for adding a remote server
+2. In the **Authentication** section, select **Custom**
+3. Add one or more authentication headers (key-value pairs)
+4. Click **"Add Server"**
+
+This allows you to configure arbitrary headers for authentication, such as custom tokens, signatures, or multi-header auth schemes.
 
 ### Managing Servers
 
@@ -262,8 +313,8 @@ curl -X POST http://localhost:3099/api/servers \
     "name": "Atlassian MCP",
     "transport": "streamable-http",
     "url": "https://mcp.atlassian.com/v1/mcp",
-    "oauth": {
-      "enabled": true
+    "auth": {
+      "mode": "oauth"
     },
     "enabled": true
   }'
@@ -275,11 +326,57 @@ curl -X POST http://localhost:3099/api/servers \
     "name": "My Remote MCP",
     "transport": "sse",
     "url": "https://mcp.example.com/sse",
-    "oauth": {
-      "enabled": true,
+    "auth": {
+      "mode": "oauth",
       "clientId": "my-client-id",
       "clientSecret": "my-client-secret",
       "scopes": ["read", "write"]
+    },
+    "enabled": true
+  }'
+
+# Remote server with bearer token (e.g. GitHub Copilot)
+curl -X POST http://localhost:3099/api/servers \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "GitHub Copilot MCP",
+    "transport": "streamable-http",
+    "url": "https://api.githubcopilot.com/mcp/",
+    "auth": {
+      "mode": "bearer",
+      "token": "your-access-token-here"
+    },
+    "enabled": true
+  }'
+
+# Remote server with API key
+curl -X POST http://localhost:3099/api/servers \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "My API Service",
+    "transport": "sse",
+    "url": "https://api.example.com/mcp",
+    "auth": {
+      "mode": "api-key",
+      "key": "your-api-key",
+      "headerName": "X-API-Key"
+    },
+    "enabled": true
+  }'
+
+# Remote server with custom auth headers
+curl -X POST http://localhost:3099/api/servers \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Custom Auth Server",
+    "transport": "streamable-http",
+    "url": "https://custom.example.com/mcp",
+    "auth": {
+      "mode": "custom",
+      "headers": {
+        "X-Custom-Token": "token-value",
+        "X-Tenant-ID": "my-tenant"
+      }
     },
     "enabled": true
   }'

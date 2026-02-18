@@ -13,6 +13,13 @@ import type {
   ResourceInfo,
   PromptInfo,
   GatewayEvent,
+  AuthConfig,
+  OAuthAuthConfig,
+} from "./types.js";
+import {
+  getEffectiveAuthConfig,
+  buildAuthHeaders,
+  requiresOAuthProvider,
 } from "./types.js";
 import type { Store } from "./store.js";
 import type { OAuthManager } from "./oauth.js";
@@ -43,6 +50,22 @@ const MAX_RECONNECT_DELAY_MS = 30000;
  * can take longer. This sets a more generous default of 5 minutes.
  */
 const DEFAULT_REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Expand tilde (~) to the user's home directory in a path.
+ * Node's spawn doesn't expand ~ like a shell does, so we need to do it manually.
+ */
+function expandTilde(path: string | undefined): string | undefined {
+  if (!path) return path;
+  if (path.startsWith("~/")) {
+    const home = process.env.HOME || process.env.USERPROFILE || "";
+    return home + path.slice(1);
+  }
+  if (path === "~") {
+    return process.env.HOME || process.env.USERPROFILE || path;
+  }
+  return path;
+}
 
 // ─── Gateway ───────────────────────────────────────────────────────────────────
 
@@ -167,15 +190,24 @@ export class Gateway extends EventEmitter {
 
     this.emitEvent({ type: "server:updated", server: updatedConfig });
 
-    // If OAuth config changed for a remote server, replace the provider
-    if (
-      updatedConfig.transport !== "stdio" &&
-      (updatedConfig as RemoteServerConfig).oauth?.enabled
-    ) {
-      this.oauthManager.replaceProvider(
-        id,
-        (updatedConfig as RemoteServerConfig).oauth!
-      );
+    // If auth config changed for a remote server using OAuth, replace the provider
+    if (updatedConfig.transport !== "stdio") {
+      const remoteConfig = updatedConfig as RemoteServerConfig;
+      const authConfig = getEffectiveAuthConfig(remoteConfig);
+      
+      if (requiresOAuthProvider(authConfig)) {
+        // Convert to legacy format for the OAuthManager
+        const oauthConfig = {
+          enabled: true,
+          clientId: (authConfig as OAuthAuthConfig).clientId,
+          clientSecret: (authConfig as OAuthAuthConfig).clientSecret,
+          scopes: (authConfig as OAuthAuthConfig).scopes,
+        };
+        this.oauthManager.replaceProvider(id, oauthConfig);
+      } else {
+        // If auth mode is no longer OAuth, remove the provider
+        this.oauthManager.removeProvider(id);
+      }
     }
 
     // Determine if we need to reconnect
@@ -340,13 +372,16 @@ export class Gateway extends EventEmitter {
       `[Gateway] Connecting to local server "${config.name}" via stdio: ${config.command} ${config.args.join(" ")}`
     );
 
+    // Expand tilde in cwd path (Node's spawn doesn't expand ~ like a shell does)
+    const expandedCwd = expandTilde(config.cwd);
+    if (config.cwd && expandedCwd !== config.cwd) {
+      console.log(`[Gateway] Expanded cwd: "${config.cwd}" -> "${expandedCwd}"`);
+    }
+    
     const transport = new StdioClientTransport({
       command: config.command,
       args: config.args,
-      env: config.env
-        ? { ...process.env, ...config.env } as Record<string, string>
-        : undefined,
-      cwd: config.cwd,
+      cwd: expandedCwd,
     });
 
     const client = new Client(
@@ -415,7 +450,14 @@ export class Gateway extends EventEmitter {
 
     const url = new URL(config.url);
 
-    // Build the auth provider if this server has OAuth enabled.
+    // Get the effective auth configuration (handles backwards compatibility)
+    const authConfig = getEffectiveAuthConfig(config);
+    
+    console.log(
+      `[Gateway] Auth mode for "${config.name}": ${authConfig.mode}`
+    );
+
+    // Build the auth provider only if using OAuth mode.
     // The SDK transports accept an `authProvider` option and automatically
     // handle 401 responses by:
     //   1. Discovering .well-known/oauth-authorization-server metadata
@@ -425,12 +467,24 @@ export class Gateway extends EventEmitter {
     //   5. On subsequent connect with tokens, attaching the Bearer header
     let authProvider = undefined;
 
-    if (config.oauth?.enabled) {
-      authProvider = this.oauthManager.getProvider(config.id, config.oauth);
+    if (requiresOAuthProvider(authConfig)) {
+      // For OAuth mode, we need to convert to legacy OAuthConfig format
+      // for the OAuthManager (which still uses the legacy format internally)
+      const oauthConfig = {
+        enabled: true,
+        clientId: (authConfig as OAuthAuthConfig).clientId,
+        clientSecret: (authConfig as OAuthAuthConfig).clientSecret,
+        scopes: (authConfig as OAuthAuthConfig).scopes,
+      };
+      authProvider = this.oauthManager.getProvider(config.id, oauthConfig);
     }
 
-    // Build extra headers (non-OAuth headers the user configured)
-    const headers: Record<string, string> = { ...(config.headers ?? {}) };
+    // Build headers: start with user-configured headers, then add auth headers
+    // For non-OAuth auth modes (bearer, api-key, custom), we add auth headers directly
+    const headers: Record<string, string> = {
+      ...(config.headers ?? {}),
+      ...buildAuthHeaders(authConfig),
+    };
 
     let transport: SSEClientTransport | StreamableHTTPClientTransport;
 
@@ -979,6 +1033,7 @@ export class Gateway extends EventEmitter {
       return (
         prev.url !== next.url ||
         JSON.stringify(prev.headers) !== JSON.stringify(next.headers) ||
+        JSON.stringify(prev.auth) !== JSON.stringify(next.auth) ||
         JSON.stringify(prev.oauth) !== JSON.stringify(next.oauth)
       );
     }
