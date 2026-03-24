@@ -23,6 +23,7 @@ import {
   Clock,
   Zap,
   KeyRound,
+  Share2,
 } from "lucide-react";
 
 interface ServerCardProps {
@@ -34,6 +35,7 @@ interface ServerCardProps {
   onToggleEnabled: (enabled: boolean) => void;
   onEdit: () => void;
   onDelete: () => void;
+  onShare: () => void;
   onInitiateAuth: () => void;
   onRevokeAuth: () => void;
 }
@@ -123,6 +125,7 @@ export default function ServerCard({
   onToggleEnabled,
   onEdit,
   onDelete,
+  onShare,
   onInitiateAuth,
   onRevokeAuth,
 }: ServerCardProps) {
@@ -300,7 +303,15 @@ export default function ServerCard({
               </button>
             )}
 
-            {/* Edit / Delete */}
+            {/* Share / Edit / Delete */}
+            <button
+              onClick={onShare}
+              disabled={isLoading}
+              className="btn-icon"
+              title="Share server config"
+            >
+              <Share2 className="w-4 h-4 text-blue-400" />
+            </button>
             <button
               onClick={onEdit}
               disabled={isLoading}

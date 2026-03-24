@@ -2,6 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { EventEmitter } from "node:events";
 import type {
   ServerConfig,
@@ -382,6 +383,7 @@ export class Gateway extends EventEmitter {
       command: config.command,
       args: config.args,
       cwd: expandedCwd,
+      env: config.env ? { ...process.env, ...config.env } : undefined,
     });
 
     const client = new Client(
@@ -588,56 +590,80 @@ export class Gateway extends EventEmitter {
     const client = managed.client;
     if (!client) return;
 
+    const serverCapabilities = client.getServerCapabilities();
+
+    // Helper to check if an error is "method not found" (expected when server doesn't support capability)
+    const isMethodNotFound = (err: unknown): boolean =>
+      err instanceof McpError && err.code === ErrorCode.MethodNotFound;
+
     // Discover tools
-    try {
-      const toolsResult = await client.listTools();
-      managed.tools = (toolsResult.tools ?? []).map((t) => ({
-        name: t.name,
-        description: t.description,
-        inputSchema: t.inputSchema as Record<string, unknown> | undefined,
-      }));
-    } catch (err) {
-      console.warn(
-        `[Gateway] Could not list tools for "${managed.config.name}":`,
-        err
-      );
+    if (serverCapabilities?.tools) {
+      try {
+        const toolsResult = await client.listTools();
+        managed.tools = (toolsResult.tools ?? []).map((t) => ({
+          name: t.name,
+          description: t.description,
+          inputSchema: t.inputSchema as Record<string, unknown> | undefined,
+        }));
+      } catch (err) {
+        if (!isMethodNotFound(err)) {
+          console.warn(
+            `[Gateway] Could not list tools for "${managed.config.name}":`,
+            err
+          );
+        }
+        managed.tools = [];
+      }
+    } else {
       managed.tools = [];
     }
 
     // Discover resources
-    try {
-      const resourcesResult = await client.listResources();
-      managed.resources = (resourcesResult.resources ?? []).map((r) => ({
-        uri: r.uri,
-        name: r.name,
-        description: r.description,
-        mimeType: r.mimeType,
-      }));
-    } catch (err) {
-      console.warn(
-        `[Gateway] Could not list resources for "${managed.config.name}":`,
-        err
-      );
+    if (serverCapabilities?.resources) {
+      try {
+        const resourcesResult = await client.listResources();
+        managed.resources = (resourcesResult.resources ?? []).map((r) => ({
+          uri: r.uri,
+          name: r.name,
+          description: r.description,
+          mimeType: r.mimeType,
+        }));
+      } catch (err) {
+        if (!isMethodNotFound(err)) {
+          console.warn(
+            `[Gateway] Could not list resources for "${managed.config.name}":`,
+            err
+          );
+        }
+        managed.resources = [];
+      }
+    } else {
       managed.resources = [];
     }
 
     // Discover prompts
-    try {
-      const promptsResult = await client.listPrompts();
-      managed.prompts = (promptsResult.prompts ?? []).map((p) => ({
-        name: p.name,
-        description: p.description,
-        arguments: p.arguments?.map((a) => ({
-          name: a.name,
-          description: a.description,
-          required: a.required,
-        })),
-      }));
-    } catch (err) {
-      console.warn(
-        `[Gateway] Could not list prompts for "${managed.config.name}":`,
-        err
-      );
+    if (serverCapabilities?.prompts) {
+      try {
+        const promptsResult = await client.listPrompts();
+        managed.prompts = (promptsResult.prompts ?? []).map((p) => ({
+          name: p.name,
+          description: p.description,
+          arguments: p.arguments?.map((a) => ({
+            name: a.name,
+            description: a.description,
+            required: a.required,
+          })),
+        }));
+      } catch (err) {
+        if (!isMethodNotFound(err)) {
+          console.warn(
+            `[Gateway] Could not list prompts for "${managed.config.name}":`,
+            err
+          );
+        }
+        managed.prompts = [];
+      }
+    } else {
       managed.prompts = [];
     }
   }

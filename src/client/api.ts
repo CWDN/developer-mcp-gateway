@@ -264,6 +264,40 @@ export interface UpdateServerPayload {
   oauth?: OAuthConfig | null;
 }
 
+// ─── Server Sharing ────────────────────────────────────────────────────────────
+
+export interface SharedServerConfig {
+  name: string;
+  enabled: boolean;
+  transport: ServerTransport;
+  // Local (stdio)
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+  // Remote (sse / streamable-http)
+  url?: string;
+  headers?: Record<string, string>;
+  authConfig?: AuthConfig;
+  oauth?: OAuthConfig;
+}
+
+export interface ExportMetadata {
+  exportedAt: string;
+  version: string;
+  serverCount: number;
+}
+
+export interface ExportResult {
+  metadata: ExportMetadata;
+  servers: SharedServerConfig[];
+}
+
+export interface ImportResult {
+  imported: ServerEntry[];
+  skipped: string[];
+}
+
 // ─── API Base ──────────────────────────────────────────────────────────────────
 
 const API_BASE = "/api";
@@ -337,6 +371,26 @@ export async function deleteServer(
     `/servers/${encodeURIComponent(id)}`,
     { method: "DELETE" }
   );
+}
+
+// ─── Server Sharing ────────────────────────────────────────────────────────────
+
+export async function exportServers(
+  serverIds?: string[]
+): Promise<ExportResult> {
+  return request<ExportResult>("/servers/export", {
+    method: "POST",
+    body: JSON.stringify({ serverIds }),
+  });
+}
+
+export async function importServers(
+  data: ExportResult
+): Promise<ServerEntry[]> {
+  return request<ServerEntry[]>("/servers/import", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
 }
 
 // ─── Connection Control ────────────────────────────────────────────────────────

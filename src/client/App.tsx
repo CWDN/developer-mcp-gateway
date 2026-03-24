@@ -17,6 +17,7 @@ import {
 import ServerCard from "./components/ServerCard";
 import AddServerModal from "./components/AddServerModal";
 import EditServerModal from "./components/EditServerModal";
+import ShareServersModal from "./components/ShareServersModal";
 import OAuthNotification from "./components/OAuthNotification";
 import LogViewer from "./components/LogViewer";
 import {
@@ -29,12 +30,14 @@ import {
   Activity,
   Loader2,
   ScrollText,
+  Share2,
 } from "lucide-react";
 
 type ModalState =
   | { type: "none" }
   | { type: "add" }
-  | { type: "edit"; server: ServerEntry };
+  | { type: "edit"; server: ServerEntry }
+  | { type: "share"; initialTab?: "export" | "import"; preselectedServerIds?: string[] };
 
 export default function App() {
   const [servers, setServers] = useState<ServerEntry[]>([]);
@@ -44,6 +47,20 @@ export default function App() {
   const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({});
   const [searchParams, setSearchParams] = useSearchParams();
   const [showLogViewer, setShowLogViewer] = useState(false);
+
+  // ─── Share modal helpers ─────────────────────────────────────────────────
+  const handleShareAll = () => {
+    setModal({ type: "share", initialTab: "export" });
+  };
+
+  const handleShareServer = (serverId: string) => {
+    setModal({ type: "share", initialTab: "export", preselectedServerIds: [serverId] });
+  };
+
+  const handleImported = () => {
+    setModal({ type: "none" });
+    fetchServers();
+  };
 
   // ─── OAuth callback notification ─────────────────────────────────────────
   const oauthStatus = searchParams.get("oauth");
@@ -291,6 +308,14 @@ export default function App() {
                 <span className="hidden sm:inline">Logs</span>
               </button>
               <button
+                onClick={handleShareAll}
+                className="btn-ghost flex items-center gap-1.5 text-sm"
+                title="Share or import servers"
+              >
+                <Share2 className="w-4 h-4" />
+                <span className="hidden sm:inline">Share</span>
+              </button>
+              <button
                 onClick={fetchServers}
                 className="btn-ghost flex items-center gap-1.5 text-sm"
                 title="Refresh servers"
@@ -397,6 +422,7 @@ export default function App() {
                 onDelete={() => handleDelete(server.id)}
                 onInitiateAuth={() => handleInitiateAuth(server.id)}
                 onRevokeAuth={() => handleRevokeAuth(server.id)}
+                onShare={() => handleShareServer(server.id)}
               />
             ))}
           </div>
@@ -415,6 +441,15 @@ export default function App() {
           server={modal.server}
           onClose={() => setModal({ type: "none" })}
           onUpdated={handleServerUpdated}
+        />
+      )}
+      {modal.type === "share" && (
+        <ShareServersModal
+          servers={servers}
+          onClose={() => setModal({ type: "none" })}
+          onImported={handleImported}
+          initialTab={modal.initialTab}
+          preselectedServerIds={modal.preselectedServerIds}
         />
       )}
 

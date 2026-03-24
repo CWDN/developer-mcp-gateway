@@ -42,6 +42,8 @@ interface PrefixedTool extends ToolInfo {
   prefixedName: string;
   /** Original tool name on the upstream server */
   originalName: string;
+  /** Sanitized version of originalName (matches pattern ^[a-zA-Z0-9_-]{1,128}$) */
+  sanitizedName: string;
   /** Gateway server ID for routing */
   serverId: string;
   /** Human-friendly server name */
@@ -58,11 +60,29 @@ interface PrefixedResource extends ResourceInfo {
 interface PrefixedPrompt extends PromptInfo {
   prefixedName: string;
   originalName: string;
+  /** Sanitized version of originalName (matches pattern ^[a-zA-Z0-9_-]{1,128}$) */
+  sanitizedName: string;
   serverId: string;
   serverName: string;
 }
 
 // ─── Name Helpers ──────────────────────────────────────────────────────────────
+
+/**
+ * Sanitize a name to match the required pattern: ^[a-zA-Z0-9_-]{1,128}$
+ * 
+ * Replaces invalid characters with underscores and truncates to 128 chars.
+ * Examples:
+ *   "my.tool.name" → "my_tool_name"
+ *   "tool:v2" → "tool_v2"
+ *   "hello world!" → "hello_world_"
+ */
+function sanitizeName(name: string): string {
+  return name
+    .replace(/[^a-zA-Z0-9_-]+/g, "_") // Replace invalid chars with _
+    .replace(/^_+|_+$/g, "") // Trim leading/trailing underscores
+    .slice(0, 128); // Enforce max length
+}
 
 /**
  * Normalize a server name into a safe prefix for tool/prompt names.
@@ -79,9 +99,14 @@ function normalizePrefix(serverName: string): string {
 
 /**
  * Build a prefixed tool/prompt name: `serverprefix__originalname`
+ * Both parts are sanitized to ensure the result matches ^[a-zA-Z0-9_-]{1,128}$
  */
 function prefixName(serverName: string, originalName: string): string {
-  return `${normalizePrefix(serverName)}${PREFIX_SEP}${originalName}`;
+  const prefix = normalizePrefix(serverName);
+  const sanitizedOriginal = sanitizeName(originalName);
+  const combined = `${prefix}${PREFIX_SEP}${sanitizedOriginal}`;
+  // Ensure final result respects max length
+  return combined.slice(0, 128);
 }
 
 /**
@@ -224,6 +249,7 @@ function aggregateTools(gateway: Gateway): PrefixedTool[] {
     ...t,
     prefixedName: prefixName(t.serverName, t.name),
     originalName: t.name,
+    sanitizedName: sanitizeName(t.name),
   }));
 }
 
@@ -242,6 +268,7 @@ function aggregatePrompts(gateway: Gateway): PrefixedPrompt[] {
     ...p,
     prefixedName: prefixName(p.serverName, p.name),
     originalName: p.name,
+    sanitizedName: sanitizeName(p.name),
   }));
 }
 
@@ -499,14 +526,16 @@ export function createMcpProxyRouter(gateway: Gateway): Router {
     if (!parsed) return undefined;
 
     // Find the matching upstream tool
+    // Compare using sanitizedName since the prefixed name contains the sanitized version
     const allTools = aggregateTools(gateway);
     const match = allTools.find(
       (t) =>
         normalizePrefix(t.serverName) === parsed.prefix &&
-        t.originalName === parsed.originalName
+        t.sanitizedName === parsed.originalName
     );
 
     if (!match) return undefined;
+    // Return the actual originalName (not sanitized) to call the upstream server correctly
     return { serverId: match.serverId, originalName: match.originalName };
   }
 
@@ -752,11 +781,12 @@ export function createMcpProxyRouter(gateway: Gateway): Router {
         );
       }
 
+      // Compare using sanitizedName since the prefixed name contains the sanitized version
       const allPrompts = aggregatePrompts(gateway);
       const match = allPrompts.find(
         (p) =>
           normalizePrefix(p.serverName) === parsed.prefix &&
-          p.originalName === parsed.originalName
+          p.sanitizedName === parsed.originalName
       );
 
       if (!match) {

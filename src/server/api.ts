@@ -76,6 +76,176 @@ function maskAuthConfig(auth: AuthConfig | undefined): AuthConfig | undefined {
   }
 }
 
+/**
+ * Strips sensitive fields from an AuthConfig for export/sharing.
+ * Unlike maskAuthConfig which replaces with placeholders, this removes secrets entirely.
+ */
+function stripAuthSecrets(auth: AuthConfig | undefined): AuthConfig | undefined {
+  if (!auth) return undefined;
+  switch (auth.mode) {
+    case "none":
+      return auth;
+    case "oauth":
+      return { mode: "oauth", clientId: auth.clientId, scopes: auth.scopes };
+    case "bearer":
+      return { mode: "bearer", token: "<REPLACE_ME: bearer token>" };
+    case "api-key":
+      return { mode: "api-key", key: "<REPLACE_ME: api key>", headerName: auth.headerName, headerPrefix: auth.headerPrefix };
+    case "custom":
+      return { mode: "custom", headers: Object.fromEntries(Object.keys(auth.headers).map((k) => [k, "<REPLACE_ME: auth header value>"])) };
+    default:
+      return auth;
+  }
+}
+
+/**
+ * Strips sensitive fields from a legacy OAuthConfig for export/sharing.
+ */
+function stripOAuthSecrets(oauth: OAuthConfig | undefined): OAuthConfig | undefined {
+  if (!oauth) return undefined;
+  return { enabled: oauth.enabled, clientId: oauth.clientId, scopes: oauth.scopes };
+}
+
+// ─── Sensitive Data Detection (args, env, headers) ───────────────────────────
+
+/**
+ * Pattern to detect environment variable names, argument flags, or header
+ * names that commonly carry secrets.  Case-insensitive.
+ *
+ * Intentionally conservative – better to over-redact than to leak a secret
+ * when sharing configs with team-mates.
+ */
+const SENSITIVE_KEY_PATTERN =
+  /token|secret|password|passwd|credential|private|bearer|api[_.-]?key|[-_]key\b|^key$/i;
+
+/**
+ * Patterns to detect values that look like tokens or secrets.
+ */
+const SENSITIVE_VALUE_PATTERNS: RegExp[] = [
+  // Well-known token prefixes (OpenAI, GitHub, GitLab, Slack, AWS, JWT, HuggingFace …)
+  /^(sk-|pk-|rk-|ghp_|ghs_|gho_|github_pat_|glpat-|xoxb-|xoxp-|xoxs-|xapp-|eyJ|AKIA|hf_|bearer\s)/i,
+  // Long hex strings (32+ chars — likely API keys or hashes)
+  /^[0-9a-f]{32,}$/i,
+  // Long base64-ish strings (40+ chars — likely tokens)
+  /^[A-Za-z0-9+/=_-]{40,}$/,
+];
+
+/**
+ * HTTP header names that are always sensitive regardless of key-pattern match.
+ */
+const SENSITIVE_HEADER_NAMES = new Set([
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "set-cookie",
+]);
+
+function isSensitiveKey(key: string): boolean {
+  return SENSITIVE_KEY_PATTERN.test(key);
+}
+
+function isSensitiveValue(value: string): boolean {
+  return SENSITIVE_VALUE_PATTERNS.some((p) => p.test(value.trim()));
+}
+
+/**
+ * Strips sensitive values from a string-keyed record (env vars or headers).
+ * A value is redacted (replaced with "") when:
+ *   • its key matches the sensitive-key pattern, OR
+ *   • its value matches a sensitive-value pattern, OR
+ *   • its lowercased key appears in the optional `extraKeys` set.
+ */
+function stripSensitiveRecord(
+  record: Record<string, string> | undefined,
+  placeholder: string,
+  extraKeys?: Set<string>,
+): Record<string, string> | undefined {
+  if (!record) return undefined;
+  const cleaned: Record<string, string> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (
+      isSensitiveKey(key) ||
+      isSensitiveValue(value) ||
+      extraKeys?.has(key.toLowerCase())
+    ) {
+      cleaned[key] = placeholder;
+    } else {
+      cleaned[key] = value;
+    }
+  }
+  return cleaned;
+}
+
+/**
+ * Strips sensitive values from an environment variable map.
+ */
+function stripSensitiveEnv(
+  env: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  return stripSensitiveRecord(env, "<REPLACE_ME: env value>");
+}
+
+/**
+ * Strips sensitive values from an HTTP headers map.
+ * In addition to the generic key/value patterns this also redacts well-known
+ * sensitive header names such as `Authorization` and `Cookie`.
+ */
+function stripSensitiveHeaders(
+  headers: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  return stripSensitiveRecord(headers, "<REPLACE_ME: header value>", SENSITIVE_HEADER_NAMES);
+}
+
+/**
+ * Strips sensitive values from a command-line arguments array.
+ *
+ * Handles three common patterns:
+ *  1. `--flag=value`  – redacts value if the flag or value looks sensitive
+ *  2. `--flag value`  – redacts the following positional arg if the flag name
+ *                        looks sensitive
+ *  3. bare `value`    – redacts if the value itself looks like a token
+ */
+function stripSensitiveArgs(args: string[] | undefined): string[] | undefined {
+  if (!args || args.length === 0) return args;
+  const result: string[] = [];
+  let redactNext = false;
+
+  for (const arg of args) {
+    if (redactNext) {
+      result.push("<REPLACE_ME: secret value>");
+      redactNext = false;
+      continue;
+    }
+
+    // --flag=value
+    const eqIdx = arg.indexOf("=");
+    if (eqIdx > 0 && arg.startsWith("-")) {
+      const flag = arg.slice(0, eqIdx);
+      const value = arg.slice(eqIdx + 1);
+      if (isSensitiveKey(flag) || isSensitiveValue(value)) {
+        result.push(`${flag}=<REPLACE_ME: secret value>`);
+        continue;
+      }
+    }
+
+    // --flag <next-arg-is-value>
+    if (arg.startsWith("-") && isSensitiveKey(arg)) {
+      result.push(arg);
+      redactNext = true;
+      continue;
+    }
+
+    // bare token-like value
+    if (!arg.startsWith("-") && isSensitiveValue(arg)) {
+      result.push("<REPLACE_ME: secret value>");
+      continue;
+    }
+
+    result.push(arg);
+  }
+  return result;
+}
+
 // Route params types
 interface IdParams {
   id: string;
@@ -145,6 +315,225 @@ export function createApiRouter(
     } catch (err) {
       console.error("[API] Error listing servers:", err);
       res.status(500).json(error("Failed to list servers."));
+    }
+  });
+
+  // ─── Share / Export / Import ────────────────────────────────────────────────
+
+  /**
+   * POST /api/servers/export
+   * Export server configs for sharing. Strips IDs, timestamps, and secrets.
+   */
+  router.post("/servers/export", (_req: Request, res: Response) => {
+    try {
+      const body = _req.body as { serverIds?: string[] };
+      const allConfigs = store.getAllServers();
+
+      let configs: ServerConfig[];
+      if (body.serverIds && Array.isArray(body.serverIds) && body.serverIds.length > 0) {
+        const ids = body.serverIds;
+        configs = allConfigs.filter((c) => ids.includes(c.id));
+        if (configs.length === 0) {
+          res.status(404).json(error("No servers found for the provided IDs."));
+          return;
+        }
+      } else {
+        configs = allConfigs;
+      }
+
+      const servers = configs.map((config) => {
+        // Build a copy without id, createdAt, updatedAt, and with secrets stripped
+        const { id: _id, createdAt: _ca, updatedAt: _ua, ...rest } = config;
+
+        if (rest.transport === "stdio") {
+          const stdioConfig = rest as Omit<LocalServerConfig, "id" | "createdAt" | "updatedAt">;
+          return {
+            ...stdioConfig,
+            args: stripSensitiveArgs(stdioConfig.args),
+            env: stripSensitiveEnv(stdioConfig.env),
+          };
+        }
+
+        // Remote config — strip auth secrets and oauthState
+        const remoteRest = rest as Omit<RemoteServerConfig, "id" | "createdAt" | "updatedAt">;
+        const { oauth, auth, headers, oauthState: _os, ...remoteBase } = remoteRest as typeof remoteRest & { oauthState?: unknown };
+
+        return {
+          ...remoteBase,
+          headers: stripSensitiveHeaders(headers),
+          ...(auth ? { auth: stripAuthSecrets(auth) } : {}),
+          ...(oauth ? { oauth: stripOAuthSecrets(oauth) } : {}),
+        };
+      });
+
+      res.json(
+        success({
+          metadata: {
+            exportedAt: now(),
+            version: "1",
+            serverCount: servers.length,
+          },
+          servers,
+        })
+      );
+    } catch (err) {
+      console.error("[API] Error exporting servers:", err);
+      res.status(500).json(error("Failed to export servers."));
+    }
+  });
+
+  /**
+   * POST /api/servers/import
+   * Import shared server configs. Generates new IDs, deduplicates names,
+   * and sets imported servers to disabled by default.
+   */
+  router.post("/servers/import", async (req: Request, res: Response) => {
+    try {
+      const body = req.body as {
+        servers?: unknown[];
+        metadata?: { version?: string };
+      };
+
+      if (!body.servers || !Array.isArray(body.servers) || body.servers.length === 0) {
+        res.status(400).json(error("Request body must include a non-empty 'servers' array."));
+        return;
+      }
+
+      // Optional version check
+      if (body.metadata?.version && body.metadata.version !== "1") {
+        res.status(400).json(error(`Unsupported import version "${body.metadata.version}". Expected "1".`));
+        return;
+      }
+
+      const existingConfigs = store.getAllServers();
+      const existingNames = new Set(existingConfigs.map((c) => c.name));
+      const createdServers: unknown[] = [];
+
+      for (const raw of body.servers) {
+        const entry = raw as Record<string, unknown>;
+
+        // Validate required fields
+        if (!entry.name || typeof entry.name !== "string" || !(entry.name as string).trim()) {
+          res.status(400).json(error("Each imported server must have a 'name' field."));
+          return;
+        }
+        if (!entry.transport || typeof entry.transport !== "string") {
+          res.status(400).json(error(`Server "${entry.name}" is missing a valid 'transport' field.`));
+          return;
+        }
+
+        const transport = entry.transport as string;
+        if (!["stdio", "sse", "streamable-http"].includes(transport)) {
+          res.status(400).json(error(`Server "${entry.name}" has invalid transport "${transport}".`));
+          return;
+        }
+
+        // Deduplicate name
+        let name = (entry.name as string).trim();
+        if (existingNames.has(name)) {
+          let suffix = 1;
+          let candidate = `${name} (imported)`;
+          while (existingNames.has(candidate)) {
+            suffix++;
+            candidate = `${name} (imported ${suffix})`;
+          }
+          name = candidate;
+        }
+        existingNames.add(name);
+
+        const id = uuidv4();
+        const timestamp = now();
+
+        let config: ServerConfig;
+
+        if (transport === "stdio") {
+          if (!entry.command || typeof entry.command !== "string") {
+            res.status(400).json(error(`Stdio server "${name}" is missing a 'command' field.`));
+            return;
+          }
+          config = {
+            id,
+            name,
+            enabled: false,
+            transport: "stdio",
+            command: entry.command as string,
+            args: stripSensitiveArgs((Array.isArray(entry.args) ? entry.args : []) as string[]) ?? [],
+            env: stripSensitiveEnv((entry.env as Record<string, string>) ?? undefined),
+            cwd: (entry.cwd as string) ?? undefined,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          } satisfies LocalServerConfig;
+        } else {
+          if (!entry.url || typeof entry.url !== "string") {
+            res.status(400).json(error(`Remote server "${name}" is missing a 'url' field.`));
+            return;
+          }
+          try {
+            new URL(entry.url as string);
+          } catch {
+            res.status(400).json(error(`Remote server "${name}" has an invalid URL.`));
+            return;
+          }
+
+          // Rebuild auth config — keep mode but ensure secrets are blank
+          let auth: AuthConfig | undefined;
+          const rawAuth = entry.auth as AuthConfig | undefined;
+          if (rawAuth && rawAuth.mode) {
+            auth = stripAuthSecrets(rawAuth);
+          }
+
+          // Rebuild legacy oauth config
+          let oauth: OAuthConfig | undefined;
+          const rawOAuth = entry.oauth as OAuthConfig | undefined;
+          if (rawOAuth) {
+            oauth = stripOAuthSecrets(rawOAuth);
+          }
+
+          config = {
+            id,
+            name,
+            enabled: false,
+            transport: transport as "sse" | "streamable-http",
+            url: entry.url as string,
+            headers: stripSensitiveHeaders((entry.headers as Record<string, string>) ?? undefined),
+            auth,
+            oauth,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          } satisfies RemoteServerConfig;
+        }
+
+        const status = await gateway.registerServer(config);
+        const remoteConfig = config.transport !== "stdio" ? (config as RemoteServerConfig) : null;
+
+        createdServers.push({
+          ...config,
+          authConfig: remoteConfig ? maskAuthConfig(remoteConfig.auth) : undefined,
+          oauth: remoteConfig?.oauth
+            ? {
+                ...remoteConfig.oauth,
+                clientSecret: remoteConfig.oauth?.clientSecret
+                  ? "••••••••"
+                  : undefined,
+              }
+            : undefined,
+          runtime: {
+            status: status.status,
+            error: status.error,
+            tools: status.tools,
+            resources: status.resources,
+            prompts: status.prompts,
+            lastConnected: status.lastConnected,
+          },
+          auth: oauthManager.getAuthStatus(config.id),
+        });
+      }
+
+      res.status(201).json(success(createdServers));
+    } catch (err) {
+      console.error("[API] Error importing servers:", err);
+      const message = err instanceof Error ? err.message : "Failed to import servers.";
+      res.status(500).json(error(message));
     }
   });
 
