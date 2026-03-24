@@ -114,6 +114,49 @@ npm start
 
 The production server runs on port `3099` by default and serves the UI from the built static files.
 
+### Running as a Background Service with PM2
+
+[PM2](https://pm2.keymetrics.io/) is a process manager for Node.js that keeps the gateway running in the background, restarts it on crashes, and can launch it automatically on system boot.
+
+**Install PM2 globally:**
+
+```bash
+npm install -g pm2
+```
+
+**Build, then start via the included ecosystem config:**
+
+```bash
+npm run build
+npm run pm2:start
+```
+
+The `ecosystem.config.cjs` file at the project root configures the process name, log file location, timestamps, and auto-restart behaviour. Logs are written to `logs/mcp-gateway.log` inside the project directory.
+
+**Other useful commands:**
+
+| Action       | npm script            | pm2 equivalent                     |
+| ------------ | --------------------- | ---------------------------------- |
+| Start        | `npm run pm2:start`   | `pm2 start ecosystem.config.cjs`   |
+| Stop         | `npm run pm2:stop`    | `pm2 stop ecosystem.config.cjs`    |
+| Restart      | `npm run pm2:restart` | `pm2 restart ecosystem.config.cjs` |
+| View logs    |                       | `pm2 logs mcp-gateway`             |
+| Process list |                       | `pm2 status`                       |
+
+
+**Start automatically on system boot:**
+
+After starting the process at least once, run:
+
+```bash
+pm2 save          # snapshot the current process list
+pm2 startup       # generate and register the startup script
+```
+
+`pm2 startup` will print a command to run (with `sudo`) — copy and execute it. After that, PM2 and the gateway will survive reboots automatically.
+
+> **Note:** The ecosystem config runs `npm start`, which requires a production build (`npm run build`) to exist first. Do not point PM2 at `npm run dev` for a persistent service — the dev server (Vite + tsx watch) is not suitable for long-running background operation.
+
 ## Configuration
 
 ### Environment Variables
