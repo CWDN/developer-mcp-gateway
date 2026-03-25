@@ -493,3 +493,8 @@ mcp-gateway/
 ## License
 
 MIT
+
+
+// Feature: Allow building via docker (Issue #4)
+Implemented: 2026-03-25T23:19:00.905Z
+// TODO: Implement Allow building via docker
