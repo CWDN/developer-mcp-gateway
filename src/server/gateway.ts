@@ -383,7 +383,9 @@ export class Gateway extends EventEmitter {
       command: config.command,
       args: config.args,
       cwd: expandedCwd,
-      env: config.env ? { ...process.env, ...config.env } : undefined,
+        env: config.env
+        ? ({ ...process.env, ...config.env } as Record<string, string>)
+        : undefined,
     });
 
     const client = new Client(
