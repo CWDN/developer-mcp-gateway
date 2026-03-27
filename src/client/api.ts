@@ -286,6 +286,7 @@ export interface ExportMetadata {
   exportedAt: string;
   version: string;
   serverCount: number;
+  includesSecrets?: boolean;
 }
 
 export interface ExportResult {
@@ -293,9 +294,24 @@ export interface ExportResult {
   servers: SharedServerConfig[];
 }
 
+/**
+ * Import mode controls how name collisions are handled:
+ *
+ *  "merge"     – (default) add all; rename collisions with "(imported)" suffix
+ *  "replace"   – remove ALL existing servers first, then import
+ *  "skip"      – add new servers, silently skip any whose name already exists
+ *  "overwrite" – update existing servers in-place when names match; add new ones
+ */
+export type ImportMode = "merge" | "replace" | "skip" | "overwrite";
+
+export interface ImportOptions {
+  mode?: ImportMode;
+}
+
 export interface ImportResult {
   imported: ServerEntry[];
   skipped: string[];
+  mode: ImportMode;
 }
 
 // ─── API Base ──────────────────────────────────────────────────────────────────
@@ -376,20 +392,22 @@ export async function deleteServer(
 // ─── Server Sharing ────────────────────────────────────────────────────────────
 
 export async function exportServers(
-  serverIds?: string[]
+  serverIds?: string[],
+  options?: { includeSecrets?: boolean }
 ): Promise<ExportResult> {
   return request<ExportResult>("/servers/export", {
     method: "POST",
-    body: JSON.stringify({ serverIds }),
+    body: JSON.stringify({ serverIds, includeSecrets: options?.includeSecrets }),
   });
 }
 
 export async function importServers(
-  data: ExportResult
-): Promise<ServerEntry[]> {
-  return request<ServerEntry[]>("/servers/import", {
+  data: ExportResult,
+  options?: ImportOptions
+): Promise<ImportResult> {
+  return request<ImportResult>("/servers/import", {
     method: "POST",
-    body: JSON.stringify(data),
+    body: JSON.stringify({ ...data, mode: options?.mode ?? "merge" }),
   });
 }
 

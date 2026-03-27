@@ -6,6 +6,7 @@ import {
   type ExportResult,
   type SharedServerConfig,
   type ConnectionStatus,
+  type ImportMode,
 } from "../api";
 import {
   Share2,
@@ -20,6 +21,11 @@ import {
   AlertCircle,
   Terminal,
   Globe,
+  Trash2,
+  RefreshCw,
+  SkipForward,
+  Layers,
+  ShieldAlert,
 } from "lucide-react";
 
 // --- Props ------------------------------------------------------------------
@@ -112,6 +118,7 @@ export default function ShareServersModal({
   const [exportResult, setExportResult] = useState<string | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [includeSecrets, setIncludeSecrets] = useState(false);
 
   // Import state
   const [importText, setImportText] = useState("");
@@ -120,6 +127,7 @@ export default function ShareServersModal({
   const [importSuccess, setImportSuccess] = useState<string | null>(null);
   const [preview, setPreview] = useState<ExportResult | null>(null);
   const [previewWarnings, setPreviewWarnings] = useState<string[]>([]);
+  const [importMode, setImportMode] = useState<ImportMode>("merge");
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -157,7 +165,10 @@ export default function ShareServersModal({
     setExportError(null);
     setExportResult(null);
     try {
-      const result = await exportServers(Array.from(selectedIds));
+      const result = await exportServers(
+        Array.from(selectedIds),
+        includeSecrets ? { includeSecrets: true } : undefined
+      );
       setExportResult(JSON.stringify(result, null, 2));
     } catch (err) {
       setExportError(
@@ -252,6 +263,7 @@ export default function ShareServersModal({
 
     const warnings: string[] = [];
     const existingNames = new Set(servers.map((s) => s.name.toLowerCase()));
+    let conflictCount = 0;
 
     for (const srv of parsed.servers) {
       const placeholders: string[] = [];
@@ -273,10 +285,18 @@ export default function ShareServersModal({
         );
       }
       if (existingNames.has(srv.name.toLowerCase())) {
-        warnings.push(
-          `"${srv.name}" conflicts with an existing server name and will be renamed.`
-        );
+        conflictCount++;
       }
+    }
+
+    if (conflictCount > 0) {
+      const names = parsed.servers
+        .filter((srv) => existingNames.has(srv.name.toLowerCase()))
+        .map((srv) => `"${srv.name}"`)
+        .join(", ");
+      warnings.push(
+        `${conflictCount} server${conflictCount !== 1 ? "s" : ""} already exist${conflictCount === 1 ? "s" : ""} (${names}). Use the import mode below to choose how to handle them.`
+      );
     }
 
     setPreviewWarnings(warnings);
@@ -285,15 +305,37 @@ export default function ShareServersModal({
 
   const handleImport = async () => {
     if (!preview) return;
+
+    if (importMode === "replace" && servers.length > 0) {
+      if (
+        !window.confirm(
+          `This will remove all ${servers.length} existing server${servers.length !== 1 ? "s" : ""} before importing. Are you sure?`
+        )
+      ) {
+        return;
+      }
+    }
+
     setImporting(true);
     setImportError(null);
     setImportSuccess(null);
     try {
-      const imported = await importServers(preview);
-      const count = imported.length;
-      setImportSuccess(
-        `Successfully imported ${count} server${count !== 1 ? "s" : ""}.`
-      );
+      const result = await importServers(preview, { mode: importMode });
+      const importedCount = result.imported.length;
+      const skippedCount = result.skipped.length;
+      const parts: string[] = [];
+
+      if (importedCount > 0) {
+        parts.push(`${importedCount} server${importedCount !== 1 ? "s" : ""} imported`);
+      }
+      if (skippedCount > 0) {
+        parts.push(`${skippedCount} skipped (${result.skipped.join(", ")})`);
+      }
+      if (importMode === "replace") {
+        parts.unshift("Existing servers cleared");
+      }
+
+      setImportSuccess(parts.join(". ") + ".");
       setPreview(null);
       setImportText("");
       onImported();
@@ -321,7 +363,9 @@ export default function ShareServersModal({
   const importBtnLabel = importing
     ? "Importing..."
     : preview
-      ? `Import ${preview.servers.length} Server${preview.servers.length !== 1 ? "s" : ""}`
+      ? importMode === "replace"
+        ? `Replace All & Import ${preview.servers.length}`
+        : `Import ${preview.servers.length} Server${preview.servers.length !== 1 ? "s" : ""}`
       : "Import";
 
   // --- Render ---
@@ -458,15 +502,48 @@ export default function ShareServersModal({
               )}
             </div>
 
+            {/* Include secrets toggle */}
+            <div className="space-y-2">
+              <label className="flex items-center gap-3 cursor-pointer group">
+                <input
+                  type="checkbox"
+                  checked={includeSecrets}
+                  onChange={(e) => setIncludeSecrets(e.target.checked)}
+                  className="w-4 h-4 rounded border-gray-600 bg-gray-700 text-gateway-500 focus:ring-gateway-500 focus:ring-offset-0"
+                />
+                <div className="flex items-center gap-1.5">
+                  <ShieldAlert className="w-4 h-4 text-yellow-400" />
+                  <span className="text-sm text-gray-300 group-hover:text-white transition-colors">
+                    Include secrets &amp; tokens
+                  </span>
+                </div>
+              </label>
+              {includeSecrets && (
+                <div className="flex items-start gap-2 text-sm text-yellow-400 bg-yellow-900/20 border border-yellow-900/30 rounded-lg px-4 py-3">
+                  <ShieldAlert className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                  <span>
+                    The exported file will contain <strong>plaintext secrets</strong> (API keys, tokens, passwords).
+                    Only share it through secure channels — never post it publicly.
+                  </span>
+                </div>
+              )}
+            </div>
+
             <div className="flex justify-end pt-2">
               <button
                 type="button"
                 onClick={handleExport}
                 disabled={selectedIds.size === 0 || exporting}
-                className="btn-primary flex items-center gap-2"
+                className={`flex items-center gap-2 ${
+                  includeSecrets
+                    ? "bg-yellow-600 hover:bg-yellow-500 text-white px-4 py-2 rounded-xl font-medium text-sm transition-colors"
+                    : "btn-primary"
+                }`}
               >
                 {exporting ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
+                ) : includeSecrets ? (
+                  <ShieldAlert className="w-4 h-4" />
                 ) : (
                   <Share2 className="w-4 h-4" />
                 )}
@@ -476,9 +553,21 @@ export default function ShareServersModal({
           </>
         ) : (
           <>
-            <div className="flex items-center gap-2 text-sm text-green-400 bg-green-900/20 border border-green-900/30 rounded-lg px-4 py-3">
-              <Check className="w-4 h-4 flex-shrink-0" />
-              <span>Export complete! Copy or download the configuration below.</span>
+            <div className={`flex items-center gap-2 text-sm rounded-lg px-4 py-3 ${
+              includeSecrets
+                ? "text-yellow-400 bg-yellow-900/20 border border-yellow-900/30"
+                : "text-green-400 bg-green-900/20 border border-green-900/30"
+            }`}>
+              {includeSecrets ? (
+                <ShieldAlert className="w-4 h-4 flex-shrink-0" />
+              ) : (
+                <Check className="w-4 h-4 flex-shrink-0" />
+              )}
+              <span>
+                {includeSecrets
+                  ? "Export complete — contains secrets! Share only through secure channels."
+                  : "Export complete! Copy or download the configuration below."}
+              </span>
             </div>
 
             <textarea
@@ -527,6 +616,37 @@ export default function ShareServersModal({
   }
 
   // --- Import tab ---
+
+  const importModes: { value: ImportMode; label: string; description: string; icon: React.ReactNode; color: string }[] = [
+    {
+      value: "merge",
+      label: "Merge",
+      description: "Add all servers; rename duplicates with \"(imported)\" suffix",
+      icon: <Layers className="w-4 h-4" />,
+      color: "gateway",
+    },
+    {
+      value: "overwrite",
+      label: "Overwrite",
+      description: "Update existing servers in-place when names match; add new ones",
+      icon: <RefreshCw className="w-4 h-4" />,
+      color: "yellow",
+    },
+    {
+      value: "skip",
+      label: "Skip Duplicates",
+      description: "Add new servers only; skip any whose name already exists",
+      icon: <SkipForward className="w-4 h-4" />,
+      color: "blue",
+    },
+    {
+      value: "replace",
+      label: "Replace All",
+      description: "Remove all existing servers first, then import",
+      icon: <Trash2 className="w-4 h-4" />,
+      color: "red",
+    },
+  ];
 
   function renderImportTab() {
     return (
@@ -608,6 +728,8 @@ export default function ShareServersModal({
               <div className="space-y-2 max-h-48 overflow-y-auto">
                 {preview.servers.map((srv, i) => {
                   const badge = getTransportBadge(srv.transport);
+                  const existingNames = new Set(servers.map((s) => s.name.toLowerCase()));
+                  const isConflict = existingNames.has(srv.name.toLowerCase());
                   return (
                     <div
                       key={i}
@@ -622,19 +744,94 @@ export default function ShareServersModal({
                         <div className="text-sm font-medium text-white truncate">
                           {srv.name}
                         </div>
+                        {isConflict && (
+                          <div className="text-xs text-gray-500 mt-0.5">
+                            {importMode === "merge" && "→ will be renamed"}
+                            {importMode === "skip" && "→ will be skipped"}
+                            {importMode === "overwrite" && "→ will update existing"}
+                            {importMode === "replace" && "→ existing will be removed first"}
+                          </div>
+                        )}
                       </div>
                       <span className={badge.className}>{badge.label}</span>
+                      {isConflict && importMode !== "replace" && (
+                        <span className={
+                          importMode === "skip"
+                            ? "badge-gray"
+                            : importMode === "overwrite"
+                              ? "badge-yellow"
+                              : "badge-blue"
+                        }>
+                          {importMode === "skip" ? "skip" : importMode === "overwrite" ? "update" : "rename"}
+                        </span>
+                      )}
                     </div>
                   );
                 })}
               </div>
             </div>
 
+            {/* Import mode picker */}
+            <div>
+              <h3 className="text-sm font-medium text-white mb-2">Import Mode</h3>
+              <div className="grid grid-cols-2 gap-2">
+                {importModes.map((m) => {
+                  const isActive = importMode === m.value;
+                  const borderColor = isActive
+                    ? m.color === "red"
+                      ? "border-red-500 bg-red-500/10"
+                      : m.color === "yellow"
+                        ? "border-yellow-500 bg-yellow-500/10"
+                        : m.color === "blue"
+                          ? "border-blue-500 bg-blue-500/10"
+                          : "border-gateway-500 bg-gateway-500/10"
+                    : "border-gray-700 bg-gray-800/50 hover:border-gray-600";
+                  const iconColor = isActive
+                    ? m.color === "red"
+                      ? "text-red-400"
+                      : m.color === "yellow"
+                        ? "text-yellow-400"
+                        : m.color === "blue"
+                          ? "text-blue-400"
+                          : "text-gateway-400"
+                    : "text-gray-500";
+                  return (
+                    <button
+                      key={m.value}
+                      type="button"
+                      onClick={() => setImportMode(m.value)}
+                      className={`flex items-start gap-2.5 px-3 py-2.5 rounded-xl border-2 text-left transition-all duration-150 ${borderColor}`}
+                    >
+                      <span className={`mt-0.5 ${iconColor}`}>{m.icon}</span>
+                      <div className="min-w-0">
+                        <div className={`text-sm font-medium ${isActive ? "text-white" : "text-gray-300"}`}>
+                          {m.label}
+                        </div>
+                        <div className="text-xs text-gray-500 leading-tight mt-0.5">
+                          {m.description}
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {importMode === "replace" && servers.length > 0 && (
+              <div className="flex items-start gap-2 text-sm text-red-400 bg-red-900/20 border border-red-900/30 rounded-lg px-4 py-3">
+                <Trash2 className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                <span>
+                  This will permanently remove {servers.length} existing server{servers.length !== 1 ? "s" : ""} and
+                  all associated OAuth state before importing.
+                </span>
+              </div>
+            )}
+
             {previewWarnings.length > 0 && (
               <div className="space-y-2">
                 {previewWarnings.map((warning, i) => (
                   <div
-                    key={i}
+                    key={`warn-${i}`}
                     className="flex items-start gap-2 text-sm text-yellow-400 bg-yellow-900/20 border border-yellow-900/30 rounded-lg px-4 py-3"
                   >
                     <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
@@ -660,10 +857,16 @@ export default function ShareServersModal({
                 type="button"
                 onClick={handleImport}
                 disabled={importing}
-                className="btn-primary flex items-center gap-2"
+                className={`flex items-center gap-2 ${
+                  importMode === "replace"
+                    ? "bg-red-600 hover:bg-red-500 text-white px-4 py-2 rounded-xl font-medium text-sm transition-colors"
+                    : "btn-primary"
+                }`}
               >
                 {importing ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
+                ) : importMode === "replace" ? (
+                  <Trash2 className="w-4 h-4" />
                 ) : (
                   <Download className="w-4 h-4" />
                 )}

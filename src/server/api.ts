@@ -326,7 +326,8 @@ export function createApiRouter(
    */
   router.post("/servers/export", (_req: Request, res: Response) => {
     try {
-      const body = _req.body as { serverIds?: string[] };
+      const body = _req.body as { serverIds?: string[]; includeSecrets?: boolean };
+      const includeSecrets = body.includeSecrets === true;
       const allConfigs = store.getAllServers();
 
       let configs: ServerConfig[];
@@ -347,16 +348,27 @@ export function createApiRouter(
 
         if (rest.transport === "stdio") {
           const stdioConfig = rest as Omit<LocalServerConfig, "id" | "createdAt" | "updatedAt">;
-          return {
-            ...stdioConfig,
-            args: stripSensitiveArgs(stdioConfig.args),
-            env: stripSensitiveEnv(stdioConfig.env),
-          };
+          return includeSecrets
+            ? stdioConfig
+            : {
+                ...stdioConfig,
+                args: stripSensitiveArgs(stdioConfig.args),
+                env: stripSensitiveEnv(stdioConfig.env),
+              };
         }
 
         // Remote config — strip auth secrets and oauthState
         const remoteRest = rest as Omit<RemoteServerConfig, "id" | "createdAt" | "updatedAt">;
         const { oauth, auth, headers, oauthState: _os, ...remoteBase } = remoteRest as typeof remoteRest & { oauthState?: unknown };
+
+        if (includeSecrets) {
+          return {
+            ...remoteBase,
+            headers,
+            ...(auth ? { auth } : {}),
+            ...(oauth ? { oauth } : {}),
+          };
+        }
 
         return {
           ...remoteBase,
@@ -372,6 +384,7 @@ export function createApiRouter(
             exportedAt: now(),
             version: "1",
             serverCount: servers.length,
+            includesSecrets: includeSecrets,
           },
           servers,
         })
@@ -387,15 +400,39 @@ export function createApiRouter(
    * Import shared server configs. Generates new IDs, deduplicates names,
    * and sets imported servers to disabled by default.
    */
+  /**
+   * Import modes:
+   *
+   *  "merge"     (default) – add imported servers alongside existing ones;
+   *               if a name collides, rename the incoming server with an
+   *               "(imported)" suffix.
+   *
+   *  "replace"   – remove *all* existing servers first, then import.
+   *
+   *  "skip"      – add imported servers but silently skip any whose name
+   *               already exists (no rename, no overwrite).
+   *
+   *  "overwrite" – if an imported server's name matches an existing one,
+   *               update the existing server in-place with the imported
+   *               config (preserves the existing id / OAuth state).
+   *               New names are added normally.
+   */
   router.post("/servers/import", async (req: Request, res: Response) => {
     try {
       const body = req.body as {
         servers?: unknown[];
         metadata?: { version?: string };
+        mode?: string;
       };
 
       if (!body.servers || !Array.isArray(body.servers) || body.servers.length === 0) {
         res.status(400).json(error("Request body must include a non-empty 'servers' array."));
+        return;
+      }
+
+      const mode = body.mode ?? "merge";
+      if (!["merge", "replace", "skip", "overwrite"].includes(mode)) {
+        res.status(400).json(error(`Invalid import mode "${mode}". Must be merge, replace, skip, or overwrite.`));
         return;
       }
 
@@ -405,9 +442,29 @@ export function createApiRouter(
         return;
       }
 
+      // ── "replace" mode: tear down every existing server first ──────────
+      if (mode === "replace") {
+        const allExisting = store.getAllServers();
+        for (const existing of allExisting) {
+          try {
+            await gateway.removeServer(existing.id);
+          } catch {
+            // Server might not be tracked by the gateway yet — remove from store directly
+            store.removeServer(existing.id);
+          }
+        }
+      }
+
+      // Build a name→config lookup of whatever remains after the optional wipe
       const existingConfigs = store.getAllServers();
-      const existingNames = new Set(existingConfigs.map((c) => c.name));
-      const createdServers: unknown[] = [];
+      const existingByName = new Map(
+        existingConfigs.map((c) => [c.name.toLowerCase(), c])
+      );
+      // Track names we've already claimed in this import batch
+      const claimedNames = new Set(existingConfigs.map((c) => c.name));
+
+      const resultServers: unknown[] = [];
+      const skippedNames: string[] = [];
 
       for (const raw of body.servers) {
         const entry = raw as Record<string, unknown>;
@@ -428,18 +485,83 @@ export function createApiRouter(
           return;
         }
 
-        // Deduplicate name
-        let name = (entry.name as string).trim();
-        if (existingNames.has(name)) {
+        const originalName = (entry.name as string).trim();
+        const existingMatch = existingByName.get(originalName.toLowerCase());
+
+        // ── "skip" mode: silently skip duplicates ──────────────────────
+        if (mode === "skip" && existingMatch) {
+          skippedNames.push(originalName);
+          continue;
+        }
+
+        // ── "overwrite" mode: update the existing server in-place ─────
+        if (mode === "overwrite" && existingMatch) {
+          const updates: UpdateServerRequest = {};
+
+          if (transport === "stdio") {
+            if (entry.command && typeof entry.command === "string") updates.command = entry.command;
+            if (Array.isArray(entry.args)) updates.args = stripSensitiveArgs(entry.args as string[]);
+            if (entry.env && typeof entry.env === "object") updates.env = stripSensitiveEnv(entry.env as Record<string, string>);
+            if (entry.cwd && typeof entry.cwd === "string") updates.cwd = entry.cwd;
+          } else {
+            if (entry.url && typeof entry.url === "string") updates.url = entry.url;
+            if (entry.headers && typeof entry.headers === "object") {
+              updates.headers = stripSensitiveHeaders(entry.headers as Record<string, string>);
+            }
+            const rawAuth = entry.auth as AuthConfig | undefined;
+            if (rawAuth?.mode) updates.auth = stripAuthSecrets(rawAuth);
+            const rawOAuth = entry.oauth as OAuthConfig | undefined;
+            if (rawOAuth) updates.oauth = stripOAuthSecrets(rawOAuth);
+          }
+
+          updates.enabled = false; // keep disabled so user can review
+
+          await gateway.updateServer(existingMatch.id, updates);
+          const updatedConfig = store.getServer(existingMatch.id);
+          const status = gateway.getServerStatus(existingMatch.id);
+
+          if (updatedConfig) {
+            const remoteConfig = updatedConfig.transport !== "stdio" ? (updatedConfig as RemoteServerConfig) : null;
+
+            resultServers.push({
+              ...updatedConfig,
+              authConfig: remoteConfig ? maskAuthConfig(remoteConfig.auth) : undefined,
+              oauth: remoteConfig?.oauth
+                ? {
+                    ...remoteConfig.oauth,
+                    clientSecret: remoteConfig.oauth?.clientSecret
+                      ? "••••••••"
+                      : undefined,
+                  }
+                : undefined,
+              runtime: status
+                ? {
+                    status: status.status,
+                    error: status.error,
+                    tools: status.tools,
+                    resources: status.resources,
+                    prompts: status.prompts,
+                    lastConnected: status.lastConnected,
+                  }
+                : { status: "disconnected", tools: [], resources: [], prompts: [] },
+              auth: oauthManager.getAuthStatus(existingMatch.id),
+            });
+          }
+          continue;
+        }
+
+        // ── "merge" mode: rename on collision ─────────────────────────
+        let name = originalName;
+        if (claimedNames.has(name)) {
           let suffix = 1;
           let candidate = `${name} (imported)`;
-          while (existingNames.has(candidate)) {
+          while (claimedNames.has(candidate)) {
             suffix++;
             candidate = `${name} (imported ${suffix})`;
           }
           name = candidate;
         }
-        existingNames.add(name);
+        claimedNames.add(name);
 
         const id = uuidv4();
         const timestamp = now();
@@ -506,7 +628,7 @@ export function createApiRouter(
         const status = await gateway.registerServer(config);
         const remoteConfig = config.transport !== "stdio" ? (config as RemoteServerConfig) : null;
 
-        createdServers.push({
+        resultServers.push({
           ...config,
           authConfig: remoteConfig ? maskAuthConfig(remoteConfig.auth) : undefined,
           oauth: remoteConfig?.oauth
@@ -529,7 +651,11 @@ export function createApiRouter(
         });
       }
 
-      res.status(201).json(success(createdServers));
+      res.status(201).json(success({
+        imported: resultServers,
+        skipped: skippedNames,
+        mode,
+      }));
     } catch (err) {
       console.error("[API] Error importing servers:", err);
       const message = err instanceof Error ? err.message : "Failed to import servers.";
