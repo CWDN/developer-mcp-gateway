@@ -111,6 +111,22 @@ export default function App() {
                         resources: event.status.resources,
                         prompts: event.status.prompts,
                         lastConnected: event.status.lastConnected,
+                        reconnectInfo: event.status.reconnectInfo,
+                      },
+                    }
+                  : s
+              )
+            );
+            break;
+          case "server:reconnect_scheduled":
+            setServers((prev) =>
+              prev.map((s) =>
+                s.id === event.serverId
+                  ? {
+                      ...s,
+                      runtime: {
+                        ...s.runtime,
+                        reconnectInfo: event.reconnectInfo,
                       },
                     }
                   : s

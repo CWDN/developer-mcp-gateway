@@ -14,6 +14,7 @@ import type {
   ResourceInfo,
   PromptInfo,
   GatewayEvent,
+  ReconnectInfo,
   AuthConfig,
   OAuthAuthConfig,
 } from "./types.js";
@@ -39,11 +40,41 @@ interface ManagedServer {
   lastConnected?: string;
   reconnectTimer?: ReturnType<typeof setTimeout>;
   reconnectAttempts: number;
+  reconnectInfo?: ReconnectInfo;
 }
 
 const MAX_RECONNECT_ATTEMPTS = 5;
 const BASE_RECONNECT_DELAY_MS = 2000;
 const MAX_RECONNECT_DELAY_MS = 30000;
+
+// Long-term retry: after initial reconnect attempts are exhausted,
+// continue retrying at increasing intervals instead of giving up.
+const LONG_TERM_RETRY_INTERVALS_MS = [
+  30_000,    // 30 seconds
+  60_000,    // 1 minute
+  2 * 60_000,  // 2 minutes
+  5 * 60_000,  // 5 minutes
+];
+const MAX_LONG_TERM_RETRY_DELAY_MS = 5 * 60_000; // cap at 5 minutes
+
+// Request-level retry: automatically retry tool/resource/prompt calls
+// that fail due to transient transport errors (e.g., SSE stream disconnects).
+const MAX_REQUEST_RETRIES = 2;
+const REQUEST_RETRY_DELAY_MS = 1000;
+
+/** Patterns that indicate a transient transport error worth retrying. */
+const TRANSIENT_ERROR_PATTERNS = [
+  "SSE stream disconnected",
+  "TypeError: terminated",
+  "terminated",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "socket hang up",
+  "network error",
+  "fetch failed",
+  "UND_ERR_CONNECT_TIMEOUT",
+];
 
 /**
  * Default timeout for tool/resource/prompt requests in milliseconds.
@@ -342,6 +373,7 @@ export class Gateway extends EventEmitter {
       managed.reconnectTimer = undefined;
     }
     managed.reconnectAttempts = 0;
+    managed.reconnectInfo = undefined;
 
     await this.closeConnection(managed);
 
@@ -359,6 +391,7 @@ export class Gateway extends EventEmitter {
     }
 
     managed.reconnectAttempts = 0; // Reset attempts on manual reconnect
+    managed.reconnectInfo = undefined;
     await this.disconnectServer(id);
     await this.connectServer(id);
   }
@@ -689,6 +722,96 @@ export class Gateway extends EventEmitter {
     return this.getServerStatus(id)!;
   }
 
+  // ─── Request Retry Logic ──────────────────────────────────────────────────
+
+  /**
+   * Check whether an error is a transient transport failure that can be retried.
+   */
+  private isTransientError(err: unknown): boolean {
+    const message =
+      err instanceof Error ? err.message : String(err);
+    const lower = message.toLowerCase();
+    return TRANSIENT_ERROR_PATTERNS.some((p) => lower.includes(p.toLowerCase()));
+  }
+
+  /**
+   * Execute a request against a managed server with automatic retry on
+   * transient transport errors (e.g., "SSE stream disconnected: TypeError: terminated").
+   *
+   * On a transient failure the helper will:
+   *   1. Wait briefly for the connection-level reconnect to complete.
+   *   2. If the server is back to "connected", retry the request.
+   *   3. If not, attempt a reconnect itself, then retry.
+   *
+   * Non-transient errors are thrown immediately.
+   */
+  private async executeWithRetry<T>(
+    managed: ManagedServer,
+    operationLabel: string,
+    fn: () => Promise<T>
+  ): Promise<T> {
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt <= MAX_REQUEST_RETRIES; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        lastError = err;
+
+        if (attempt >= MAX_REQUEST_RETRIES || !this.isTransientError(err)) {
+          throw err;
+        }
+
+        const errMsg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[Gateway] Transient error during ${operationLabel} on "${managed.config.name}" ` +
+            `(attempt ${attempt + 1}/${MAX_REQUEST_RETRIES + 1}): ${errMsg}`
+        );
+
+        // Wait a moment for the transport-level reconnect (onclose handler) to kick in
+        await new Promise((resolve) =>
+          setTimeout(resolve, REQUEST_RETRY_DELAY_MS)
+        );
+
+        // If the server isn't connected yet, try to reconnect ourselves
+        if (managed.status !== "connected" || !managed.client) {
+          console.log(
+            `[Gateway] Attempting reconnect for "${managed.config.name}" before retry…`
+          );
+          try {
+            // Reset reconnect state so connectServer doesn't skip
+            if (managed.reconnectTimer) {
+              clearTimeout(managed.reconnectTimer);
+              managed.reconnectTimer = undefined;
+            }
+            managed.reconnectAttempts = 0;
+            managed.reconnectInfo = undefined;
+            await this.connectServer(managed.config.id);
+          } catch (reconnectErr) {
+            console.error(
+              `[Gateway] Reconnect failed for "${managed.config.name}" during retry:`,
+              reconnectErr
+            );
+            // Throw the original request error, not the reconnect error
+            throw err;
+          }
+        }
+
+        // Final guard: if still not connected after reconnect, give up
+        if (managed.status !== "connected" || !managed.client) {
+          throw err;
+        }
+
+        console.log(
+          `[Gateway] Retrying ${operationLabel} on "${managed.config.name}" ` +
+            `(attempt ${attempt + 2}/${MAX_REQUEST_RETRIES + 1})…`
+        );
+      }
+    }
+
+    throw lastError;
+  }
+
   // ─── Tool Invocation ──────────────────────────────────────────────────────
 
   /**
@@ -709,10 +832,15 @@ export class Gateway extends EventEmitter {
       );
     }
 
-    return managed.client.callTool(
-      { name: toolName, arguments: args },
-      undefined,
-      { timeout: DEFAULT_REQUEST_TIMEOUT_MS }
+    return this.executeWithRetry(
+      managed,
+      `callTool("${toolName}")`,
+      () =>
+        managed.client!.callTool(
+          { name: toolName, arguments: args },
+          undefined,
+          { timeout: DEFAULT_REQUEST_TIMEOUT_MS }
+        )
     );
   }
 
@@ -728,10 +856,15 @@ export class Gateway extends EventEmitter {
       if (managed.status !== "connected" || !managed.client) continue;
       const hasTool = managed.tools.some((t) => t.name === toolName);
       if (hasTool) {
-        const result = await managed.client.callTool(
-          { name: toolName, arguments: args },
-          undefined,
-          { timeout: DEFAULT_REQUEST_TIMEOUT_MS }
+        const result = await this.executeWithRetry(
+          managed,
+          `callTool("${toolName}")`,
+          () =>
+            managed.client!.callTool(
+              { name: toolName, arguments: args },
+              undefined,
+              { timeout: DEFAULT_REQUEST_TIMEOUT_MS }
+            )
         );
         return { serverId: id, result };
       }
@@ -760,9 +893,14 @@ export class Gateway extends EventEmitter {
       );
     }
 
-    return managed.client.readResource(
-      { uri },
-      { timeout: DEFAULT_REQUEST_TIMEOUT_MS }
+    return this.executeWithRetry(
+      managed,
+      `readResource("${uri}")`,
+      () =>
+        managed.client!.readResource(
+          { uri },
+          { timeout: DEFAULT_REQUEST_TIMEOUT_MS }
+        )
     );
   }
 
@@ -786,9 +924,14 @@ export class Gateway extends EventEmitter {
       );
     }
 
-    return managed.client.getPrompt(
-      { name, arguments: args },
-      { timeout: DEFAULT_REQUEST_TIMEOUT_MS }
+    return this.executeWithRetry(
+      managed,
+      `getPrompt("${name}")`,
+      () =>
+        managed.client!.getPrompt(
+          { name, arguments: args },
+          { timeout: DEFAULT_REQUEST_TIMEOUT_MS }
+        )
     );
   }
 
@@ -812,6 +955,7 @@ export class Gateway extends EventEmitter {
       resources: [...managed.resources],
       prompts: [...managed.prompts],
       lastConnected: managed.lastConnected,
+      reconnectInfo: managed.reconnectInfo,
     };
   }
 
@@ -832,6 +976,7 @@ export class Gateway extends EventEmitter {
         resources: [...managed.resources],
         prompts: [...managed.prompts],
         lastConnected: managed.lastConnected,
+        reconnectInfo: managed.reconnectInfo,
       });
     }
     return statuses;
@@ -942,6 +1087,7 @@ export class Gateway extends EventEmitter {
       resources: [],
       prompts: [],
       reconnectAttempts: 0,
+      reconnectInfo: undefined,
     };
   }
 
@@ -999,40 +1145,65 @@ export class Gateway extends EventEmitter {
   private scheduleReconnect(managed: ManagedServer): void {
     if (this.shutdownRequested) return;
     if (!managed.config.enabled) return;
-    if (managed.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-      console.log(
-        `[Gateway] Max reconnect attempts reached for "${managed.config.name}".`
-      );
-      this.setStatus(
-        managed,
-        "error",
-        `Failed to reconnect after ${MAX_RECONNECT_ATTEMPTS} attempts.`
-      );
-      return;
-    }
 
-    // Exponential backoff with jitter
-    const delay = Math.min(
-      BASE_RECONNECT_DELAY_MS * Math.pow(2, managed.reconnectAttempts) +
-        Math.random() * 1000,
-      MAX_RECONNECT_DELAY_MS
-    );
+    const isLongTermRetry = managed.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS;
+    let delay: number;
+
+    if (!isLongTermRetry) {
+      // Phase 1: Exponential backoff with jitter (initial reconnect attempts)
+      delay = Math.min(
+        BASE_RECONNECT_DELAY_MS * Math.pow(2, managed.reconnectAttempts) +
+          Math.random() * 1000,
+        MAX_RECONNECT_DELAY_MS
+      );
+    } else {
+      // Phase 2: Long-term retry with increasing intervals
+      const longTermIndex = managed.reconnectAttempts - MAX_RECONNECT_ATTEMPTS;
+      const baseDelay =
+        longTermIndex < LONG_TERM_RETRY_INTERVALS_MS.length
+          ? LONG_TERM_RETRY_INTERVALS_MS[longTermIndex]
+          : MAX_LONG_TERM_RETRY_DELAY_MS;
+      // Add small jitter (up to 5% of the base delay)
+      delay = baseDelay + Math.random() * baseDelay * 0.05;
+    }
 
     managed.reconnectAttempts++;
 
+    const nextRetryAt = new Date(Date.now() + delay).toISOString();
+    const reconnectInfo: ReconnectInfo = {
+      attempt: managed.reconnectAttempts,
+      maxAttempts: MAX_RECONNECT_ATTEMPTS,
+      nextRetryAt,
+      delayMs: Math.round(delay),
+      isLongTermRetry,
+    };
+    managed.reconnectInfo = reconnectInfo;
+
+    const phase = isLongTermRetry ? "long-term retry" : "reconnect";
     console.log(
-      `[Gateway] Scheduling reconnect for "${managed.config.name}" in ${Math.round(delay)}ms (attempt ${managed.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`
+      `[Gateway] Scheduling ${phase} for "${managed.config.name}" in ${Math.round(delay / 1000)}s (attempt ${managed.reconnectAttempts}${isLongTermRetry ? ", long-term" : `/${MAX_RECONNECT_ATTEMPTS}`})...`
     );
+
+    // Emit reconnect_scheduled event so the frontend can show countdown
+    this.emitEvent({
+      type: "server:reconnect_scheduled",
+      serverId: managed.config.id,
+      reconnectInfo,
+    });
+
+    // Also emit status so the UI updates immediately with reconnectInfo
+    this.emitStatusEvent(managed);
 
     managed.reconnectTimer = setTimeout(async () => {
       managed.reconnectTimer = undefined;
+      managed.reconnectInfo = undefined;
       if (this.shutdownRequested || !managed.config.enabled) return;
 
       try {
         await this.connectServer(managed.config.id);
       } catch (err) {
         console.error(
-          `[Gateway] Reconnect attempt failed for "${managed.config.name}":`,
+          `[Gateway] ${phase} attempt failed for "${managed.config.name}":`,
           err
         );
       }

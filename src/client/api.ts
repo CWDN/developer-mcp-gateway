@@ -149,6 +149,19 @@ export interface PromptInfo {
   arguments?: { name: string; description?: string; required?: boolean }[];
 }
 
+export interface ReconnectInfo {
+  /** Which attempt number is pending (1-based) */
+  attempt: number;
+  /** Maximum attempts before entering long-term retry phase */
+  maxAttempts: number;
+  /** ISO 8601 timestamp of the next scheduled retry */
+  nextRetryAt: string;
+  /** Delay in ms until the next retry */
+  delayMs: number;
+  /** Whether the server has entered the long-term retry phase */
+  isLongTermRetry: boolean;
+}
+
 export interface ServerRuntime {
   status: ConnectionStatus;
   error?: string;
@@ -156,6 +169,7 @@ export interface ServerRuntime {
   resources: ResourceInfo[];
   prompts: PromptInfo[];
   lastConnected?: string;
+  reconnectInfo?: ReconnectInfo;
 }
 
 export interface AuthStatus {
@@ -199,6 +213,7 @@ export interface ServerStatus {
   resources: ResourceInfo[];
   prompts: PromptInfo[];
   lastConnected?: string;
+  reconnectInfo?: ReconnectInfo;
 }
 
 export interface HealthInfo {
@@ -572,6 +587,7 @@ export type GatewayEventData =
   | { type: "server:removed"; serverId: string }
   | { type: "server:connected"; serverId: string }
   | { type: "server:disconnected"; serverId: string; error?: string }
+  | { type: "server:reconnect_scheduled"; serverId: string; reconnectInfo: ReconnectInfo }
   | { type: "oauth:required"; serverId: string; authUrl: string }
   | { type: "log:started"; log: RequestLogEntry }
   | { type: "log:completed"; log: RequestLogEntry };

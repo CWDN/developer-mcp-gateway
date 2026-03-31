@@ -1,8 +1,14 @@
 import React, { useState } from "react";
 import { createServer, type CreateServerPayload, type AuthConfig, type AuthMode } from "../api";
-import { X, Terminal, Globe, Plus, Minus, Shield, Loader2, AlertCircle, Key, Lock } from "lucide-react";
+import { X, Terminal, Globe, Plus, Minus, Shield, Loader2, AlertCircle, Key, Lock, Store } from "lucide-react";
+import RegistryBrowser from "./RegistryBrowser";
+import {
+  type RegistryServer,
+  getServerDisplayName,
+  getServerTransportType,
+} from "../registry";
 
-type ServerType = "local" | "remote";
+type ServerType = "local" | "remote" | "registry";
 type RemoteTransport = "sse" | "streamable-http";
 
 interface AddServerModalProps {
@@ -22,7 +28,7 @@ interface HeaderEntry {
 
 export default function AddServerModal({ onClose, onCreated }: AddServerModalProps) {
   // General
-  const [serverType, setServerType] = useState<ServerType>("local");
+  const [serverType, setServerType] = useState<ServerType>("registry");
   const [name, setName] = useState("");
   const [enabled, setEnabled] = useState(true);
   const [submitting, setSubmitting] = useState(false);
@@ -81,6 +87,77 @@ export default function AddServerModal({ onClose, onCreated }: AddServerModalPro
     setHeaders(headers.filter((_, i) => i !== index));
   const updateHeader = (index: number, field: "key" | "value", val: string) =>
     setHeaders(headers.map((h, i) => (i === index ? { ...h, [field]: val } : h)));
+
+  // ─── Submit ────────────────────────────────────────────────────────────────
+
+  // ─── Apply preset ──────────────────────────────────────────────────────────
+
+  const applyRegistryServer = (server: RegistryServer) => {
+    const displayName = getServerDisplayName(server);
+    const transportType = getServerTransportType(server);
+    setName(displayName);
+    setError(null);
+
+    if (transportType === "stdio" && server.packages && server.packages.length > 0) {
+      const pkg = server.packages.find((p) => p.transport?.type === "stdio") || server.packages[0];
+      setServerType("local");
+      setCommand("npx");
+      setArgs(`-y ${pkg.identifier}`);
+      setCwd("");
+      if (pkg.environmentVariables && pkg.environmentVariables.length > 0) {
+        setEnvVars(
+          pkg.environmentVariables.map((v) => ({ key: v.name, value: "" }))
+        );
+      } else {
+        setEnvVars([]);
+      }
+    } else if (server.remotes && server.remotes.length > 0) {
+      const remote = server.remotes[0];
+      setServerType("remote");
+      setRemoteTransport(remote.type === "sse" ? "sse" : "streamable-http");
+      setUrl(remote.url);
+      setHeaders([]);
+
+      // Detect auth requirements from headers
+      const authHeader = remote.headers?.find(
+        (h) => h.name.toLowerCase() === "authorization",
+      );
+      if (authHeader) {
+        setAuthMode("bearer");
+        setBearerToken("");
+      } else {
+        setAuthMode("none");
+      }
+      setOauthScopes("");
+      setOauthClientId("");
+      setOauthClientSecret("");
+      setApiKey("");
+      setCustomAuthHeaders([]);
+    } else {
+      // Fallback: use the first package as local stdio if available
+      if (server.packages && server.packages.length > 0) {
+        const pkg = server.packages[0];
+        setServerType("local");
+        setCommand("npx");
+        setArgs(`-y ${pkg.identifier}`);
+        setCwd("");
+        if (pkg.environmentVariables && pkg.environmentVariables.length > 0) {
+          setEnvVars(
+            pkg.environmentVariables.map((v) => ({ key: v.name, value: "" }))
+          );
+        } else {
+          setEnvVars([]);
+        }
+      } else {
+        // No transport info — default to remote with empty URL
+        setServerType("remote");
+        setRemoteTransport("streamable-http");
+        setUrl("");
+        setHeaders([]);
+        setAuthMode("none");
+      }
+    }
+  };
 
   // ─── Submit ────────────────────────────────────────────────────────────────
 
@@ -262,6 +339,21 @@ export default function AddServerModal({ onClose, onCreated }: AddServerModalPro
           <div className="flex gap-2">
             <button
               type="button"
+              onClick={() => setServerType("registry")}
+              className={`flex-1 flex items-center justify-center gap-2 px-4 py-3 rounded-xl border-2 transition-all duration-150 ${
+                serverType === "registry"
+                  ? "border-gateway-500 bg-gateway-500/10 text-white"
+                  : "border-gray-700 bg-gray-800/50 text-gray-400 hover:border-gray-600 hover:text-gray-300"
+              }`}
+            >
+              <Store className="w-5 h-5" />
+              <div className="text-left">
+                <div className="text-sm font-medium">Registry</div>
+                <div className="text-xs opacity-60">MCP Registry</div>
+              </div>
+            </button>
+            <button
+              type="button"
               onClick={() => setServerType("local")}
               className={`flex-1 flex items-center justify-center gap-2 px-4 py-3 rounded-xl border-2 transition-all duration-150 ${
                 serverType === "local"
@@ -292,6 +384,12 @@ export default function AddServerModal({ onClose, onCreated }: AddServerModalPro
             </button>
           </div>
 
+          {/* ─── Template Selector ──────────────────────────────────────────── */}
+          {serverType === "registry" && (
+            <RegistryBrowser onSelect={applyRegistryServer} />
+          )}
+
+          {serverType !== "registry" && (<>
           {/* Server Name */}
           <div>
             <label htmlFor="server-name" className="label">
@@ -794,7 +892,10 @@ export default function AddServerModal({ onClose, onCreated }: AddServerModalPro
             </>
           )}
 
+          </>)}
+
           {/* Enabled toggle */}
+          {serverType !== "registry" && (
           <div className="flex items-center gap-3">
             <button
               type="button"
@@ -813,6 +914,7 @@ export default function AddServerModal({ onClose, onCreated }: AddServerModalPro
               {enabled ? "Connect immediately after adding" : "Add without connecting"}
             </label>
           </div>
+          )}
 
           {/* Actions */}
           <div className="flex items-center justify-end gap-3 pt-2 border-t border-gray-800">
@@ -824,6 +926,7 @@ export default function AddServerModal({ onClose, onCreated }: AddServerModalPro
             >
               Cancel
             </button>
+            {serverType !== "registry" && (
             <button
               type="submit"
               className="btn-primary flex items-center gap-2"
@@ -836,6 +939,7 @@ export default function AddServerModal({ onClose, onCreated }: AddServerModalPro
               )}
               {submitting ? "Adding..." : "Add Server"}
             </button>
+            )}
           </div>
         </form>
       </div>

@@ -275,6 +275,19 @@ export function requiresOAuthProvider(auth: AuthConfig): boolean {
 
 // ─── Runtime State ─────────────────────────────────────────────────────────────
 
+export interface ReconnectInfo {
+  /** Which attempt number is pending (1-based) */
+  attempt: number;
+  /** Maximum attempts before entering long-term retry phase */
+  maxAttempts: number;
+  /** ISO 8601 timestamp of the next scheduled retry */
+  nextRetryAt: string;
+  /** Delay in ms until the next retry */
+  delayMs: number;
+  /** Whether the server has entered the long-term retry phase */
+  isLongTermRetry: boolean;
+}
+
 export interface ServerStatus {
   id: string;
   name: string;
@@ -286,6 +299,7 @@ export interface ServerStatus {
   resources: ResourceInfo[];
   prompts: PromptInfo[];
   lastConnected?: string;
+  reconnectInfo?: ReconnectInfo;
 }
 
 export interface ToolInfo {
@@ -378,4 +392,5 @@ export type GatewayEvent =
   | { type: "server:status"; status: ServerStatus }
   | { type: "server:connected"; serverId: string }
   | { type: "server:disconnected"; serverId: string; error?: string }
+  | { type: "server:reconnect_scheduled"; serverId: string; reconnectInfo: ReconnectInfo }
   | { type: "oauth:required"; serverId: string; authUrl: string };

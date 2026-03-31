@@ -1,5 +1,5 @@
-import React, { useState } from "react";
-import type { ServerEntry, ConnectionStatus } from "../api";
+import React, { useState, useEffect } from "react";
+import type { ServerEntry, ConnectionStatus, ReconnectInfo } from "../api";
 import {
   ChevronDown,
   ChevronUp,
@@ -21,6 +21,7 @@ import {
   Loader2,
   AlertCircle,
   Clock,
+  Timer,
   Zap,
   KeyRound,
   Share2,
@@ -206,6 +207,11 @@ export default function ServerCard({
                   <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
                   <span className="break-all">{runtime.error}</span>
                 </div>
+              )}
+
+              {/* Reconnect countdown */}
+              {runtime.reconnectInfo && (
+                <ReconnectCountdown reconnectInfo={runtime.reconnectInfo} />
               )}
 
               {/* Capability summary (when connected) */}
@@ -606,6 +612,67 @@ export default function ServerCard({
             )}
         </div>
       )}
+    </div>
+  );
+}
+
+// ─── Reconnect Countdown ─────────────────────────────────────────────────────
+
+function formatCountdown(ms: number): string {
+  if (ms <= 0) return "now";
+  const totalSecs = Math.ceil(ms / 1000);
+  if (totalSecs < 60) return `${totalSecs}s`;
+  const mins = Math.floor(totalSecs / 60);
+  const secs = totalSecs % 60;
+  return secs > 0 ? `${mins}m ${secs}s` : `${mins}m`;
+}
+
+function ReconnectCountdown({ reconnectInfo }: { reconnectInfo: ReconnectInfo }) {
+  const [remainingMs, setRemainingMs] = useState(() => {
+    const target = new Date(reconnectInfo.nextRetryAt).getTime();
+    return Math.max(0, target - Date.now());
+  });
+
+  useEffect(() => {
+    const target = new Date(reconnectInfo.nextRetryAt).getTime();
+
+    const tick = () => {
+      const diff = Math.max(0, target - Date.now());
+      setRemainingMs(diff);
+      if (diff <= 0) clearInterval(id);
+    };
+
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [reconnectInfo.nextRetryAt]);
+
+  const progressPct = reconnectInfo.delayMs > 0
+    ? Math.max(0, Math.min(100, 100 - (remainingMs / reconnectInfo.delayMs) * 100))
+    : 100;
+
+  const label = reconnectInfo.isLongTermRetry
+    ? `Long-term retry #${reconnectInfo.attempt - reconnectInfo.maxAttempts}`
+    : `Retry ${reconnectInfo.attempt}/${reconnectInfo.maxAttempts}`;
+
+  return (
+    <div className="mt-2 text-xs bg-yellow-900/20 border border-yellow-900/30 rounded-lg px-3 py-2">
+      <div className="flex items-center justify-between gap-2 text-yellow-400">
+        <span className="flex items-center gap-1.5">
+          <Timer className="w-3.5 h-3.5 flex-shrink-0" />
+          <span>{label}</span>
+        </span>
+        <span className="font-mono tabular-nums">
+          {remainingMs > 0 ? formatCountdown(remainingMs) : "Connecting…"}
+        </span>
+      </div>
+      {/* Progress bar */}
+      <div className="mt-1.5 h-1 bg-yellow-900/40 rounded-full overflow-hidden">
+        <div
+          className="h-full bg-yellow-500/60 rounded-full transition-all duration-1000 ease-linear"
+          style={{ width: `${progressPct}%` }}
+        />
+      </div>
     </div>
   );
 }
