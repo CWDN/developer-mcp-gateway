@@ -87,6 +87,8 @@ function getTransportBadge(transport: string): { label: string; className: strin
       return { label: "Remote (SSE)", className: "badge-blue" };
     case "streamable-http":
       return { label: "Remote (HTTP)", className: "badge-blue" };
+    case "cli":
+      return { label: "CLI", className: "badge-purple" };
     default:
       return { label: transport, className: "badge-gray" };
   }
@@ -96,6 +98,8 @@ function getTransportIcon(transport: string): React.ReactNode {
   switch (transport) {
     case "stdio":
       return <Terminal className="w-4 h-4" />;
+    case "cli":
+      return <Zap className="w-4 h-4" />;
     default:
       return <Globe className="w-4 h-4" />;
   }
@@ -184,9 +188,9 @@ export default function ServerCard({
 
               {/* Connection details */}
               <div className="mt-1.5 text-xs text-gray-500 flex items-center gap-3 flex-wrap">
-                {server.transport === "stdio" ? (
+                {(server.transport === "stdio" || server.transport === "cli") ? (
                   <span className="font-mono truncate max-w-xs" title={`${server.command} ${server.args?.join(" ") ?? ""}`}>
-                    {server.command} {server.args?.join(" ")}
+                    {server.command} {server.transport === "stdio" ? server.args?.join(" ") : ""}
                   </span>
                 ) : (
                   <span className="font-mono truncate max-w-xs" title={server.url}>

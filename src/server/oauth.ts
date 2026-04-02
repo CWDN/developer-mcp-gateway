@@ -393,7 +393,7 @@ export class OAuthManager {
     hasClientInfo: boolean;
   } {
     const server = this.store.getServer(serverId);
-    if (!server || server.transport === "stdio") {
+    if (!server || server.transport === "stdio" || server.transport === "cli") {
       return { requiresAuth: false, isAuthenticated: false, hasClientInfo: false };
     }
 

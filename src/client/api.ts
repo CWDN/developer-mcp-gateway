@@ -1,6 +1,32 @@
 // ─── Types (mirrors server types) ──────────────────────────────────────────────
 
-export type ServerTransport = "stdio" | "sse" | "streamable-http";
+export type ServerTransport = "stdio" | "sse" | "streamable-http" | "cli";
+
+// ─── CLI Discovery Types ───────────────────────────────────────────────────────
+
+export interface DiscoveredFlag {
+  long: string;
+  short?: string;
+  description: string;
+  type: "string" | "boolean" | "number";
+  defaultValue?: string;
+}
+
+export interface DiscoveredCommand {
+  name: string;
+  description: string;
+  usage?: string;
+  positionalArgs: { name: string; required: boolean; variadic: boolean }[];
+  flags: DiscoveredFlag[];
+}
+
+export interface CliDiscoveryResult {
+  description: string;
+  tools: CliToolDefinition[];
+  globalArgs: string[];
+  globalFlags: DiscoveredFlag[];
+  commands: DiscoveredCommand[];
+}
 
 export type RequestType = "tool" | "resource" | "prompt";
 
@@ -130,6 +156,15 @@ export interface OAuthConfig {
   scopes?: string[];
 }
 
+export interface CliToolDefinition {
+  name: string;
+  description: string;
+  args: string[];
+  inputSchema?: Record<string, unknown>;
+  timeoutMs?: number;
+  cwd?: string;
+}
+
 export interface ToolInfo {
   name: string;
   description?: string;
@@ -197,6 +232,9 @@ export interface ServerEntry {
   authConfig?: AuthConfig;
   /** @deprecated Use authConfig instead */
   oauth?: OAuthConfig;
+  // CLI tool fields
+  timeoutMs?: number;
+  cliTools?: CliToolDefinition[];
   // Runtime
   runtime: ServerRuntime;
   auth: AuthStatus;
@@ -260,9 +298,22 @@ export interface InitiateAuthResponse {
   authUrl?: string;
 }
 
+export interface CreateCliServerPayload {
+  name: string;
+  transport: "cli";
+  command: string;
+  env?: Record<string, string>;
+  cwd?: string;
+  timeoutMs?: number;
+  tools?: CliToolDefinition[];
+  globalArgs?: string[];
+  enabled?: boolean;
+}
+
 export type CreateServerPayload =
-  | CreateLocalServerPayload
-  | CreateRemoteServerPayload;
+  | (CreateLocalServerPayload & { transport: "stdio" })
+  | CreateRemoteServerPayload
+  | CreateCliServerPayload;
 
 export interface UpdateServerPayload {
   name?: string;
@@ -277,6 +328,8 @@ export interface UpdateServerPayload {
   auth?: AuthConfig | null;
   /** @deprecated Use auth instead */
   oauth?: OAuthConfig | null;
+  tools?: CliToolDefinition[];
+  timeoutMs?: number;
 }
 
 // ─── Server Sharing ────────────────────────────────────────────────────────────
@@ -523,6 +576,21 @@ export async function listAllResources(): Promise<AggregatedResource[]> {
 
 export async function listAllPrompts(): Promise<AggregatedPrompt[]> {
   return request<AggregatedPrompt[]>("/prompts");
+}
+
+// ─── Tool Invocation ───────────────────────────────────────────────────────────
+
+// ─── CLI Discovery ─────────────────────────────────────────────────────────────
+
+export async function discoverCliTools(
+  command: string,
+  cwd?: string,
+  env?: Record<string, string>
+): Promise<CliDiscoveryResult> {
+  return request<CliDiscoveryResult>("/cli/discover", {
+    method: "POST",
+    body: JSON.stringify({ command, cwd, env }),
+  });
 }
 
 // ─── Tool Invocation ───────────────────────────────────────────────────────────

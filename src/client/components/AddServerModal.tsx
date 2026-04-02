@@ -1,6 +1,6 @@
 import React, { useState } from "react";
-import { createServer, type CreateServerPayload, type AuthConfig, type AuthMode } from "../api";
-import { X, Terminal, Globe, Plus, Minus, Shield, Loader2, AlertCircle, Key, Lock, Store } from "lucide-react";
+import { createServer, discoverCliTools, type CreateServerPayload, type AuthConfig, type AuthMode, type CliToolDefinition } from "../api";
+import { X, Terminal, Globe, Plus, Minus, Shield, Loader2, AlertCircle, Key, Lock, Store, Wrench, Search } from "lucide-react";
 import RegistryBrowser from "./RegistryBrowser";
 import {
   type RegistryServer,
@@ -8,7 +8,7 @@ import {
   getServerTransportType,
 } from "../registry";
 
-type ServerType = "local" | "remote" | "registry";
+type ServerType = "local" | "remote" | "registry" | "cli";
 type RemoteTransport = "sse" | "streamable-http";
 
 interface AddServerModalProps {
@@ -39,6 +39,54 @@ export default function AddServerModal({ onClose, onCreated }: AddServerModalPro
   const [args, setArgs] = useState("");
   const [cwd, setCwd] = useState("");
   const [envVars, setEnvVars] = useState<EnvVar[]>([]);
+
+  // CLI Tool state
+  const [cliTools, setCliTools] = useState<Array<{
+    name: string;
+    description: string;
+    args: string;
+    timeoutMs: string;
+  }>>([]);
+  const [cliTimeoutMs, setCliTimeoutMs] = useState("");
+  const [cliGlobalArgs, setCliGlobalArgs] = useState<string[]>([]);
+  const [discovering, setDiscovering] = useState(false);
+  const [discoveryDone, setDiscoveryDone] = useState(false);
+
+  const handleDiscover = async () => {
+    if (!command.trim()) {
+      setError("Enter a command before discovering tools.");
+      return;
+    }
+    setError(null);
+    setDiscovering(true);
+    try {
+      const result = await discoverCliTools(
+        command.trim(),
+        cwd.trim() || undefined
+      );
+      setCliTools(
+        result.tools.map((t) => ({
+          name: t.name,
+          description: t.description,
+          args: t.args.join(" "),
+          timeoutMs: "",
+        }))
+      );
+      setCliGlobalArgs(result.globalArgs);
+      setDiscoveryDone(true);
+      if (!name.trim() && result.description) {
+        // Auto-fill the server name from the CLI description (first line)
+        const firstLine = result.description.split("\n")[0].trim();
+        if (firstLine.length < 60) {
+          setName(command.trim().split("/").pop() ?? command.trim());
+        }
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Discovery failed.");
+    } finally {
+      setDiscovering(false);
+    }
+  };
 
   // Remote (sse / streamable-http)
   const [remoteTransport, setRemoteTransport] = useState<RemoteTransport>("sse");
@@ -197,6 +245,37 @@ export default function AddServerModal({ onClose, onCreated }: AddServerModalPro
         args: parsedArgs.length > 0 ? parsedArgs : undefined,
         cwd: cwd.trim() || undefined,
         env: Object.keys(env).length > 0 ? env : undefined,
+        enabled,
+      };
+    } else if (serverType === "cli") {
+      if (!command.trim()) {
+        setError("Command is required.");
+        return;
+      }
+
+      const validTools = cliTools.filter((t) => t.name.trim() && t.description.trim());
+
+      const toolDefs: CliToolDefinition[] = validTools.map((t) => ({
+        name: t.name.trim(),
+        description: t.description.trim(),
+        args: t.args.trim().split(/\s+/).filter(Boolean),
+        ...(t.timeoutMs ? { timeoutMs: parseInt(t.timeoutMs, 10) } : {}),
+      }));
+
+      const env: Record<string, string> = {};
+      for (const v of envVars) {
+        if (v.key.trim()) env[v.key.trim()] = v.value;
+      }
+
+      payload = {
+        name: name.trim() || command.trim().split("/").pop() || command.trim(),
+        transport: "cli" as const,
+        command: command.trim(),
+        ...(toolDefs.length > 0 ? { tools: toolDefs } : {}),
+        ...(cliGlobalArgs.length > 0 ? { globalArgs: cliGlobalArgs } : {}),
+        ...(cwd.trim() ? { cwd: cwd.trim() } : {}),
+        ...(Object.keys(env).length > 0 ? { env } : {}),
+        ...(cliTimeoutMs ? { timeoutMs: parseInt(cliTimeoutMs, 10) } : {}),
         enabled,
       };
     } else {
@@ -369,6 +448,21 @@ export default function AddServerModal({ onClose, onCreated }: AddServerModalPro
             </button>
             <button
               type="button"
+              onClick={() => setServerType("cli")}
+              className={`flex-1 flex items-center justify-center gap-2 px-4 py-3 rounded-xl border-2 transition-all duration-150 ${
+                serverType === "cli"
+                  ? "border-gateway-500 bg-gateway-500/10 text-white"
+                  : "border-gray-700 bg-gray-800/50 text-gray-400 hover:border-gray-600 hover:text-gray-300"
+              }`}
+            >
+              <Wrench className="w-5 h-5" />
+              <div className="text-left">
+                <div className="text-sm font-medium">CLI Tool</div>
+                <div className="text-xs opacity-60">cli transport</div>
+              </div>
+            </button>
+            <button
+              type="button"
               onClick={() => setServerType("remote")}
               className={`flex-1 flex items-center justify-center gap-2 px-4 py-3 rounded-xl border-2 transition-all duration-150 ${
                 serverType === "remote"
@@ -389,7 +483,305 @@ export default function AddServerModal({ onClose, onCreated }: AddServerModalPro
             <RegistryBrowser onSelect={applyRegistryServer} />
           )}
 
-          {serverType !== "registry" && (<>
+          {/* ─── CLI Tool Fields ─────────────────────────────────────────── */}
+          {serverType === "cli" && (
+            <div className="space-y-4">
+              {/* Command + Discover */}
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-1">
+                  Command <span className="text-red-400">*</span>
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={command}
+                    onChange={(e) => {
+                      setCommand(e.target.value);
+                      setDiscoveryDone(false);
+                    }}
+                    placeholder="e.g., cymbal"
+                    className="input-field flex-1"
+                    autoFocus
+                  />
+                  <button
+                    type="button"
+                    onClick={handleDiscover}
+                    disabled={discovering || !command.trim()}
+                    className="btn-primary flex items-center gap-1.5 px-3 whitespace-nowrap"
+                  >
+                    {discovering ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Search className="w-4 h-4" />
+                    )}
+                    {discovering ? "Discovering…" : "Discover Tools"}
+                  </button>
+                </div>
+                <p className="text-xs text-gray-500 mt-1">
+                  Enter the CLI binary name or path, then click Discover to auto-detect tools from <code>--help</code>
+                </p>
+              </div>
+
+              {/* Server Name */}
+              <div>
+                <label htmlFor="server-name" className="label">
+                  Server Name
+                </label>
+                <input
+                  id="server-name"
+                  type="text"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder={command.trim() ? command.trim().split("/").pop() : "e.g., My CLI Tool"}
+                  className="input-field"
+                />
+              </div>
+
+              {/* Working Directory */}
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-1">
+                  Working Directory
+                </label>
+                <input
+                  type="text"
+                  value={cwd}
+                  onChange={(e) => setCwd(e.target.value)}
+                  placeholder="e.g., ~/projects/my-repo"
+                  className="input-field"
+                />
+              </div>
+
+              {/* Global Args */}
+              {cliGlobalArgs.length > 0 && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-1">
+                    Global Flags
+                  </label>
+                  <div className="flex flex-wrap gap-1.5">
+                    {cliGlobalArgs.map((arg) => (
+                      <span
+                        key={arg}
+                        className="badge-green font-mono text-xs"
+                      >
+                        {arg}
+                      </span>
+                    ))}
+                  </div>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Appended to every tool invocation automatically
+                  </p>
+                </div>
+              )}
+
+              {/* Default Timeout */}
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-1">
+                  Default Timeout (ms)
+                </label>
+                <input
+                  type="number"
+                  value={cliTimeoutMs}
+                  onChange={(e) => setCliTimeoutMs(e.target.value)}
+                  placeholder="30000"
+                  className="input-field"
+                />
+              </div>
+
+              {/* Environment Variables — reuse existing envVars UI */}
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-sm font-medium text-gray-300">
+                    Environment Variables
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setEnvVars([...envVars, { key: "", value: "" }])}
+                    className="btn-ghost text-xs flex items-center gap-1"
+                  >
+                    <Plus className="w-3 h-3" /> Add
+                  </button>
+                </div>
+                {envVars.length > 0 && (
+                  <div className="space-y-2">
+                    {envVars.map((env, i) => (
+                      <div key={i} className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          value={env.key}
+                          onChange={(e) => updateEnvVar(i, "key", e.target.value)}
+                          placeholder="KEY"
+                          className="input-field font-mono flex-1"
+                        />
+                        <span className="text-gray-600">=</span>
+                        <input
+                          type="text"
+                          value={env.value}
+                          onChange={(e) => updateEnvVar(i, "value", e.target.value)}
+                          placeholder="value"
+                          className="input-field font-mono flex-1"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => removeEnvVar(i)}
+                          className="btn-icon text-red-400 hover:text-red-300"
+                        >
+                          <Minus className="w-3 h-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Tool Definitions */}
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-sm font-medium text-gray-300">
+                    Tools
+                    {cliTools.length > 0 && (
+                      <span className="text-xs text-gray-500 font-normal ml-1.5">
+                        ({cliTools.length} {discoveryDone ? "discovered" : "defined"})
+                      </span>
+                    )}
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setCliTools([
+                        ...cliTools,
+                        { name: "", description: "", args: "", timeoutMs: "" },
+                      ])
+                    }
+                    className="btn-ghost text-xs flex items-center gap-1"
+                  >
+                    <Plus className="w-3 h-3" /> Add Tool
+                  </button>
+                </div>
+                {cliTools.length === 0 && !discoveryDone && (
+                  <div className="text-center py-6 text-gray-500 bg-white/5 border border-white/10 border-dashed rounded-lg">
+                    <Wrench className="w-6 h-6 mx-auto mb-2 opacity-50" />
+                    <p className="text-sm">No tools defined yet</p>
+                    <p className="text-xs mt-1">
+                      Click <strong>Discover Tools</strong> above to auto-detect, or add manually
+                    </p>
+                  </div>
+                )}
+                {cliTools.length === 0 && discoveryDone && (
+                  <div className="text-center py-6 text-yellow-500/80 bg-yellow-900/10 border border-yellow-900/20 border-dashed rounded-lg">
+                    <AlertCircle className="w-6 h-6 mx-auto mb-2 opacity-50" />
+                    <p className="text-sm">No tools discovered</p>
+                    <p className="text-xs mt-1 text-gray-500">
+                      The CLI may not have subcommands, or uses a non-standard help format.
+                      <br />Tools will be auto-discovered when the server connects.
+                    </p>
+                  </div>
+                )}
+                <div className="space-y-3">
+                  {cliTools.map((tool, i) => (
+                    <div
+                      key={i}
+                      className="bg-white/5 border border-white/10 rounded-lg p-3 space-y-2"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-medium text-gray-400">
+                          Tool {i + 1}
+                        </span>
+                        {cliTools.length > 1 && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setCliTools(cliTools.filter((_, j) => j !== i))
+                            }
+                            className="btn-icon text-red-400 hover:text-red-300"
+                          >
+                            <Minus className="w-3 h-3" />
+                          </button>
+                        )}
+                      </div>
+                      <input
+                        type="text"
+                        value={tool.name}
+                        onChange={(e) => {
+                          const updated = [...cliTools];
+                          updated[i] = { ...updated[i], name: e.target.value };
+                          setCliTools(updated);
+                        }}
+                        placeholder="Tool name (e.g., search)"
+                        className="input-field"
+                      />
+                      <input
+                        type="text"
+                        value={tool.description}
+                        onChange={(e) => {
+                          const updated = [...cliTools];
+                          updated[i] = { ...updated[i], description: e.target.value };
+                          setCliTools(updated);
+                        }}
+                        placeholder="Description (e.g., Search for symbols in the codebase)"
+                        className="input-field"
+                      />
+                      <input
+                        type="text"
+                        value={tool.args}
+                        onChange={(e) => {
+                          const updated = [...cliTools];
+                          updated[i] = { ...updated[i], args: e.target.value };
+                          setCliTools(updated);
+                        }}
+                        placeholder="Args template (e.g., search {{query}} --json)"
+                        className="input-field"
+                      />
+                      <p className="text-xs text-gray-500">
+                        Use {"{{paramName}}"} for parameter placeholders. Space-separated.
+                      </p>
+                      <input
+                        type="number"
+                        value={tool.timeoutMs}
+                        onChange={(e) => {
+                          const updated = [...cliTools];
+                          updated[i] = { ...updated[i], timeoutMs: e.target.value };
+                          setCliTools(updated);
+                        }}
+                        placeholder="Timeout override (ms, optional)"
+                        className="input-field"
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Enabled toggle */}
+              <div className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  id="cli-enabled"
+                  checked={enabled}
+                  onChange={(e) => setEnabled(e.target.checked)}
+                  className="rounded border-gray-600 bg-gray-800 text-gateway-500 focus:ring-gateway-500"
+                />
+                <label htmlFor="cli-enabled" className="text-sm text-gray-300">
+                  Enable server after creation
+                </label>
+              </div>
+
+              {/* Submit */}
+              <div className="flex justify-end gap-3 pt-2">
+                <button type="button" onClick={onClose} className="btn-ghost">
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className="btn-primary flex items-center gap-2"
+                >
+                  {submitting && <Loader2 className="w-4 h-4 animate-spin" />}
+                  Add Server
+                </button>
+              </div>
+            </div>
+          )}
+
+          {serverType !== "registry" && serverType !== "cli" && (<>
           {/* Server Name */}
           <div>
             <label htmlFor="server-name" className="label">

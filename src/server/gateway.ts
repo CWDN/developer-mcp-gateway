@@ -3,11 +3,15 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { EventEmitter } from "node:events";
 import type {
   ServerConfig,
   LocalServerConfig,
   RemoteServerConfig,
+  CliServerConfig,
+  CliToolDefinition,
   ServerStatus,
   ConnectionStatus,
   ToolInfo,
@@ -23,8 +27,11 @@ import {
   buildAuthHeaders,
   requiresOAuthProvider,
 } from "./types.js";
+import { discoverCliTools, camelToKebab } from "./cli-discovery.js";
 import type { Store } from "./store.js";
 import type { OAuthManager } from "./oauth.js";
+
+const execFileAsync = promisify(execFile);
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
@@ -223,7 +230,7 @@ export class Gateway extends EventEmitter {
     this.emitEvent({ type: "server:updated", server: updatedConfig });
 
     // If auth config changed for a remote server using OAuth, replace the provider
-    if (updatedConfig.transport !== "stdio") {
+    if (updatedConfig.transport !== "stdio" && updatedConfig.transport !== "cli") {
       const remoteConfig = updatedConfig as RemoteServerConfig;
       const authConfig = getEffectiveAuthConfig(remoteConfig);
       
@@ -331,6 +338,8 @@ export class Gateway extends EventEmitter {
 
       if (config.transport === "stdio") {
         await this.connectLocalServer(managed, config);
+      } else if (config.transport === "cli") {
+        await this.connectCliServer(managed, config);
       } else {
         await this.connectRemoteServer(managed, config);
       }
@@ -475,6 +484,173 @@ export class Gateway extends EventEmitter {
     );
 
     this.emitEvent({ type: "server:connected", serverId: config.id });
+  }
+
+  /**
+   * Auto-generate a JSON Schema from {{placeholder}} patterns in a CLI args template.
+   * Each placeholder becomes a required string property.
+   */
+  private buildSchemaFromArgs(args: string[]): Record<string, unknown> {
+    const params: string[] = [];
+    for (const arg of args) {
+      for (const match of arg.matchAll(/\{\{(\w+)\}\}/g)) {
+        if (!params.includes(match[1])) {
+          params.push(match[1]);
+        }
+      }
+    }
+    const properties: Record<string, { type: string; description: string }> = {};
+    for (const p of params) {
+      properties[p] = { type: "string", description: `Value for ${p}` };
+    }
+    return {
+      type: "object",
+      properties,
+      ...(params.length > 0 ? { required: params } : {}),
+    };
+  }
+
+  private async connectCliServer(
+    managed: ManagedServer,
+    config: CliServerConfig
+  ): Promise<void> {
+    console.log(
+      `[Gateway] Connecting CLI server "${config.name}": ${config.command}`
+    );
+
+    let toolDefs = config.tools ?? [];
+
+    // Auto-discover tools if none were provided
+    if (toolDefs.length === 0) {
+      console.log(
+        `[Gateway] No tools defined for "${config.name}" — running auto-discovery…`
+      );
+      try {
+        const discovery = await discoverCliTools(config.command, {
+          cwd: expandTilde(config.cwd),
+          env: config.env,
+        });
+        toolDefs = discovery.tools;
+
+        // Persist discovered tools and globalArgs back to the config so they
+        // survive restarts and appear in the API / UI.
+        config.tools = toolDefs;
+        if (discovery.globalArgs.length > 0 && !config.globalArgs) {
+          config.globalArgs = discovery.globalArgs;
+        }
+        this.store.updateServer(config.id, {
+          tools: toolDefs,
+          globalArgs: config.globalArgs,
+        } as Partial<CliServerConfig>);
+
+        console.log(
+          `[Gateway] Auto-discovered ${toolDefs.length} tools for "${config.name}"` +
+            (config.globalArgs?.length
+              ? ` (global args: ${config.globalArgs.join(" ")})`
+              : "")
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[Gateway] Auto-discovery failed for "${config.name}": ${msg}`
+        );
+        this.setStatus(managed, "error", `Auto-discovery failed: ${msg}`);
+        return;
+      }
+    }
+
+    // CLI servers don't use a persistent connection — register tools statically.
+    // Auto-generate inputSchema from {{placeholder}} patterns when not provided.
+    managed.tools = toolDefs.map((t) => ({
+      name: t.name,
+      description: t.description,
+      inputSchema: t.inputSchema ?? this.buildSchemaFromArgs(t.args),
+    }));
+
+    // No transport or client needed for CLI servers
+    managed.client = null;
+    managed.transport = null;
+    managed.resources = [];
+    managed.prompts = [];
+
+    this.setStatus(managed, "connected");
+    managed.lastConnected = new Date().toISOString();
+    managed.reconnectAttempts = 0;
+
+    console.log(
+      `[Gateway] CLI server "${config.name}" ready — ${managed.tools.length} tools`
+    );
+
+    this.emitEvent({ type: "server:connected", serverId: config.id });
+  }
+
+  private async executeCliTool(
+    config: CliServerConfig,
+    toolDef: CliToolDefinition,
+    args: Record<string, unknown>
+  ): Promise<string> {
+    // Track which parameters were consumed by template placeholders
+    const consumedParams = new Set<string>();
+
+    // Build command arguments by replacing {{paramName}} placeholders
+    const builtArgs = toolDef.args.map((arg) =>
+      arg.replace(/\{\{(\w+)\}\}/g, (_match, paramName: string) => {
+        consumedParams.add(paramName);
+        const value = args[paramName];
+        return value !== undefined && value !== null ? String(value) : "";
+      })
+    );
+
+    // Append remaining parameters that weren't consumed by placeholders.
+    // Convert camelCase param names to --kebab-case flags (reverse of discovery).
+    for (const [key, value] of Object.entries(args)) {
+      if (consumedParams.has(key)) continue;
+      if (value === undefined || value === null) continue;
+
+      const flagName = camelToKebab(key);
+      if (typeof value === "boolean") {
+        if (value) {
+          builtArgs.push(`--${flagName}`);
+        }
+      } else {
+        builtArgs.push(`--${flagName}`, String(value));
+      }
+    }
+
+    // Append server-level global args (e.g., --json) if not already present
+    if (config.globalArgs) {
+      for (const ga of config.globalArgs) {
+        if (!builtArgs.includes(ga)) {
+          builtArgs.push(ga);
+        }
+      }
+    }
+
+    const cwd = expandTilde(toolDef.cwd ?? config.cwd);
+    const env = config.env
+      ? ({ ...process.env, ...config.env } as Record<string, string>)
+      : (process.env as Record<string, string>);
+    const timeoutMs = toolDef.timeoutMs ?? config.timeoutMs ?? 30000;
+
+    console.log(
+      `[Gateway] Executing CLI tool "${toolDef.name}": ${config.command} ${builtArgs.join(" ")}`
+    );
+
+    try {
+      const { stdout } = await execFileAsync(config.command, builtArgs, {
+        cwd,
+        env,
+        timeout: timeoutMs,
+        maxBuffer: 10 * 1024 * 1024, // 10 MB
+      });
+      return stdout;
+    } catch (err: unknown) {
+      const error = err as Error & { stderr?: string; code?: number | string };
+      const stderr = error.stderr || error.message;
+      throw new Error(
+        `CLI tool "${toolDef.name}" failed (exit code ${error.code ?? "unknown"}): ${stderr}`
+      );
+    }
   }
 
   private async connectRemoteServer(
@@ -774,7 +950,7 @@ export class Gateway extends EventEmitter {
         );
 
         // If the server isn't connected yet, try to reconnect ourselves
-        if (managed.status !== "connected" || !managed.client) {
+        if (managed.status !== "connected" || (managed.config.transport !== "cli" && !managed.client)) {
           console.log(
             `[Gateway] Attempting reconnect for "${managed.config.name}" before retry…`
           );
@@ -798,7 +974,7 @@ export class Gateway extends EventEmitter {
         }
 
         // Final guard: if still not connected after reconnect, give up
-        if (managed.status !== "connected" || !managed.client) {
+        if (managed.status !== "connected" || (managed.config.transport !== "cli" && !managed.client)) {
           throw err;
         }
 
@@ -826,9 +1002,31 @@ export class Gateway extends EventEmitter {
     if (!managed) {
       throw new Error(`Server "${serverId}" not found in gateway.`);
     }
-    if (managed.status !== "connected" || !managed.client) {
+    if (managed.status !== "connected") {
       throw new Error(
         `Server "${managed.config.name}" is not connected. Cannot call tool "${toolName}".`
+      );
+    }
+    if (managed.config.transport !== "cli" && !managed.client) {
+      throw new Error(
+        `Server "${managed.config.name}" is not connected. Cannot call tool "${toolName}".`
+      );
+    }
+
+    // CLI tools are executed directly, not via MCP client
+    if (managed.config.transport === "cli") {
+      const cliConfig = managed.config as CliServerConfig;
+      const toolDef = cliConfig.tools?.find((t) => t.name === toolName);
+      if (!toolDef) {
+        throw new Error(`Tool "${toolName}" not found on CLI server "${managed.config.name}".`);
+      }
+      return this.executeWithRetry(
+        managed,
+        `callTool("${toolName}")`,
+        async () => {
+          const output = await this.executeCliTool(cliConfig, toolDef, args);
+          return { content: [{ type: "text", text: output }] };
+        }
       );
     }
 
@@ -853,9 +1051,26 @@ export class Gateway extends EventEmitter {
     args: Record<string, unknown>
   ): Promise<{ serverId: string; result: unknown }> {
     for (const [id, managed] of this.servers.entries()) {
-      if (managed.status !== "connected" || !managed.client) continue;
+      if (managed.status !== "connected") continue;
+      if (managed.config.transport !== "cli" && !managed.client) continue;
       const hasTool = managed.tools.some((t) => t.name === toolName);
       if (hasTool) {
+        // CLI tools are executed directly, not via MCP client
+        if (managed.config.transport === "cli") {
+          const cliConfig = managed.config as CliServerConfig;
+          const toolDef = cliConfig.tools?.find((t) => t.name === toolName);
+          if (!toolDef) continue;
+          const result = await this.executeWithRetry(
+            managed,
+            `callTool("${toolName}")`,
+            async () => {
+              const output = await this.executeCliTool(cliConfig, toolDef, args);
+              return { content: [{ type: "text", text: output }] };
+            }
+          );
+          return { serverId: id, result };
+        }
+
         const result = await this.executeWithRetry(
           managed,
           `callTool("${toolName}")`,
@@ -1228,7 +1443,20 @@ export class Gateway extends EventEmitter {
       );
     }
 
-    if (prev.transport !== "stdio" && next.transport !== "stdio") {
+    if (prev.transport === "cli" && next.transport === "cli") {
+      return (
+        prev.command !== next.command ||
+        JSON.stringify(prev.env) !== JSON.stringify(next.env) ||
+        prev.cwd !== next.cwd ||
+        prev.timeoutMs !== next.timeoutMs ||
+        JSON.stringify(prev.tools) !== JSON.stringify(next.tools)
+      );
+    }
+
+    if (
+      (prev.transport === "sse" || prev.transport === "streamable-http") &&
+      (next.transport === "sse" || next.transport === "streamable-http")
+    ) {
       return (
         prev.url !== next.url ||
         JSON.stringify(prev.headers) !== JSON.stringify(next.headers) ||

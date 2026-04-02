@@ -1,9 +1,12 @@
 import { Router, type Request, type Response } from "express";
 import { v4 as uuidv4 } from "uuid";
+import { discoverCliTools } from "./cli-discovery.js";
 import type {
   ServerConfig,
   LocalServerConfig,
   RemoteServerConfig,
+  CliServerConfig,
+  CliToolDefinition,
   CreateServerRequest,
   UpdateServerRequest,
   ApiResponse,
@@ -264,6 +267,47 @@ export function createApiRouter(
 ): Router {
   const router = Router();
 
+  // ─── CLI Tool Discovery ──────────────────────────────────────────────────
+
+  /**
+   * POST /api/cli/discover
+   * Auto-discover tools from a CLI binary by parsing its --help output.
+   */
+  router.post("/cli/discover", async (req: Request, res: Response) => {
+    try {
+      const { command, cwd, env } = req.body as {
+        command?: string;
+        cwd?: string;
+        env?: Record<string, string>;
+      };
+
+      if (!command || typeof command !== "string" || !command.trim()) {
+        res.status(400).json(error("Command is required."));
+        return;
+      }
+
+      const result = await discoverCliTools(command.trim(), {
+        cwd: cwd?.trim() || undefined,
+        env,
+        timeoutMs: 15_000,
+      });
+
+      res.json(
+        success({
+          description: result.globalDescription,
+          tools: result.tools,
+          globalArgs: result.globalArgs,
+          globalFlags: result.globalFlags,
+          commands: result.commands,
+        })
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error("[API] CLI discovery failed:", message);
+      res.status(500).json(error(`Discovery failed: ${message}`));
+    }
+  });
+
   // ─── Server CRUD ─────────────────────────────────────────────────────────
 
   /**
@@ -278,7 +322,7 @@ export function createApiRouter(
       const servers = configs.map((config) => {
         const status = statuses.find((s) => s.id === config.id);
         const authStatus = oauthManager.getAuthStatus(config.id);
-        const remoteConfig = config.transport !== "stdio" ? (config as RemoteServerConfig) : null;
+        const remoteConfig = config.transport !== "stdio" && config.transport !== "cli" ? (config as RemoteServerConfig) : null;
 
         return {
           ...config,
@@ -354,6 +398,16 @@ export function createApiRouter(
                 ...stdioConfig,
                 args: stripSensitiveArgs(stdioConfig.args),
                 env: stripSensitiveEnv(stdioConfig.env),
+              };
+        }
+
+        if (rest.transport === "cli") {
+          const cliConfig = rest as Omit<CliServerConfig, "id" | "createdAt" | "updatedAt">;
+          return includeSecrets
+            ? cliConfig
+            : {
+                ...cliConfig,
+                env: stripSensitiveEnv(cliConfig.env),
               };
         }
 
@@ -480,7 +534,7 @@ export function createApiRouter(
         }
 
         const transport = entry.transport as string;
-        if (!["stdio", "sse", "streamable-http"].includes(transport)) {
+        if (!["stdio", "sse", "streamable-http", "cli"].includes(transport)) {
           res.status(400).json(error(`Server "${entry.name}" has invalid transport "${transport}".`));
           return;
         }
@@ -503,6 +557,12 @@ export function createApiRouter(
             if (Array.isArray(entry.args)) updates.args = stripSensitiveArgs(entry.args as string[]);
             if (entry.env && typeof entry.env === "object") updates.env = stripSensitiveEnv(entry.env as Record<string, string>);
             if (entry.cwd && typeof entry.cwd === "string") updates.cwd = entry.cwd;
+          } else if (transport === "cli") {
+            if (entry.command && typeof entry.command === "string") updates.command = entry.command;
+            if (entry.env && typeof entry.env === "object") updates.env = stripSensitiveEnv(entry.env as Record<string, string>);
+            if (entry.cwd && typeof entry.cwd === "string") updates.cwd = entry.cwd;
+            if (entry.timeoutMs !== undefined) updates.timeoutMs = entry.timeoutMs as number;
+            if (Array.isArray(entry.tools)) updates.tools = entry.tools as CliToolDefinition[];
           } else {
             if (entry.url && typeof entry.url === "string") updates.url = entry.url;
             if (entry.headers && typeof entry.headers === "object") {
@@ -521,7 +581,7 @@ export function createApiRouter(
           const status = gateway.getServerStatus(existingMatch.id);
 
           if (updatedConfig) {
-            const remoteConfig = updatedConfig.transport !== "stdio" ? (updatedConfig as RemoteServerConfig) : null;
+            const remoteConfig = updatedConfig.transport !== "stdio" && updatedConfig.transport !== "cli" ? (updatedConfig as RemoteServerConfig) : null;
 
             resultServers.push({
               ...updatedConfig,
@@ -585,6 +645,28 @@ export function createApiRouter(
             createdAt: timestamp,
             updatedAt: timestamp,
           } satisfies LocalServerConfig;
+        } else if (transport === "cli") {
+          if (!entry.command || typeof entry.command !== "string") {
+            res.status(400).json(error(`CLI server "${name}" is missing a 'command' field.`));
+            return;
+          }
+          if (!Array.isArray(entry.tools) || (entry.tools as unknown[]).length === 0) {
+            res.status(400).json(error(`CLI server "${name}" must have at least one tool definition.`));
+            return;
+          }
+          config = {
+            id,
+            name,
+            enabled: false,
+            transport: "cli",
+            command: entry.command as string,
+            env: stripSensitiveEnv((entry.env as Record<string, string>) ?? undefined),
+            cwd: (entry.cwd as string) ?? undefined,
+            timeoutMs: (entry.timeoutMs as number) ?? undefined,
+            tools: entry.tools as CliToolDefinition[],
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          } satisfies CliServerConfig;
         } else {
           if (!entry.url || typeof entry.url !== "string") {
             res.status(400).json(error(`Remote server "${name}" is missing a 'url' field.`));
@@ -626,7 +708,7 @@ export function createApiRouter(
         }
 
         const status = await gateway.registerServer(config);
-        const remoteConfig = config.transport !== "stdio" ? (config as RemoteServerConfig) : null;
+        const remoteConfig = config.transport !== "stdio" && config.transport !== "cli" ? (config as RemoteServerConfig) : null;
 
         resultServers.push({
           ...config,
@@ -678,7 +760,7 @@ export function createApiRouter(
 
       const status = gateway.getServerStatus(id);
       const authStatus = oauthManager.getAuthStatus(id);
-      const remoteConfig = config.transport !== "stdio" ? (config as RemoteServerConfig) : null;
+      const remoteConfig = config.transport !== "stdio" && config.transport !== "cli" ? (config as RemoteServerConfig) : null;
 
       const server = {
         ...config,
@@ -808,12 +890,53 @@ export function createApiRouter(
           createdAt: timestamp,
           updatedAt: timestamp,
         } satisfies RemoteServerConfig;
+      } else if (body.transport === "cli") {
+        if (!body.command || typeof body.command !== "string") {
+          res
+            .status(400)
+            .json(error("Command is required for CLI transport."));
+          return;
+        }
+
+        // Validate tool definitions if provided (tools are optional — when
+        // omitted, the gateway auto-discovers them on connect via --help).
+        if (body.tools && Array.isArray(body.tools)) {
+          for (const tool of body.tools) {
+            if (!tool.name || typeof tool.name !== "string") {
+              res.status(400).json(error("Each tool must have a name."));
+              return;
+            }
+            if (!tool.description || typeof tool.description !== "string") {
+              res.status(400).json(error("Each tool must have a description."));
+              return;
+            }
+            if (!Array.isArray(tool.args)) {
+              res.status(400).json(error(`Tool "${tool.name}" must have an args array.`));
+              return;
+            }
+          }
+        }
+
+        config = {
+          id,
+          name: body.name.trim(),
+          enabled: body.enabled !== false,
+          transport: "cli",
+          command: body.command,
+          env: body.env,
+          cwd: body.cwd,
+          timeoutMs: body.timeoutMs,
+          tools: body.tools ?? [],
+          globalArgs: body.globalArgs,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        } satisfies CliServerConfig;
       } else {
         res.status(400).json(
           error(
             `Invalid transport "${String(
               (body as unknown as Record<string, unknown>).transport
-            )}". Must be stdio, sse, or streamable-http.`
+            )}". Must be stdio, sse, streamable-http, or cli.`
           )
         );
         return;
@@ -829,7 +952,7 @@ export function createApiRouter(
       }
 
       const status = await gateway.registerServer(config);
-      const remoteConfig = config.transport !== "stdio" ? (config as RemoteServerConfig) : null;
+      const remoteConfig = config.transport !== "stdio" && config.transport !== "cli" ? (config as RemoteServerConfig) : null;
 
       res.status(201).json(
         success({
@@ -931,6 +1054,17 @@ export function createApiRouter(
             (updates as Partial<LocalServerConfig>).env = body.env;
           if (body.cwd !== undefined)
             (updates as Partial<LocalServerConfig>).cwd = body.cwd;
+        } else if (existing.transport === "cli") {
+          if (body.command !== undefined)
+            (updates as Partial<CliServerConfig>).command = body.command;
+          if (body.env !== undefined)
+            (updates as Partial<CliServerConfig>).env = body.env ?? undefined;
+          if (body.cwd !== undefined)
+            (updates as Partial<CliServerConfig>).cwd = body.cwd ?? undefined;
+          if (body.timeoutMs !== undefined)
+            (updates as Partial<CliServerConfig>).timeoutMs = body.timeoutMs ?? undefined;
+          if (body.tools !== undefined)
+            (updates as Partial<CliServerConfig>).tools = body.tools;
         } else {
           if (body.url !== undefined)
             (updates as Partial<RemoteServerConfig>).url = body.url;
@@ -949,7 +1083,7 @@ export function createApiRouter(
 
         const status = await gateway.updateServer(id, updates);
         const updatedConfig = store.getServer(id)!;
-        const remoteConfig = updatedConfig.transport !== "stdio" ? (updatedConfig as RemoteServerConfig) : null;
+        const remoteConfig = updatedConfig.transport !== "stdio" && updatedConfig.transport !== "cli" ? (updatedConfig as RemoteServerConfig) : null;
 
         res.json(
           success({

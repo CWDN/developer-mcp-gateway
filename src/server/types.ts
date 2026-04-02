@@ -145,7 +145,7 @@ export interface OAuthPersistedState {
 
 // ─── MCP Server Configuration ──────────────────────────────────────────────────
 
-export type ServerTransport = "stdio" | "sse" | "streamable-http";
+export type ServerTransport = "stdio" | "sse" | "streamable-http" | "cli";
 
 export type ConnectionStatus =
   | "disconnected"
@@ -190,7 +190,53 @@ export interface RemoteServerConfig extends BaseServerConfig {
   oauth?: OAuthConfig;
 }
 
-export type ServerConfig = LocalServerConfig | RemoteServerConfig;
+/** Definition of a single CLI tool exposed by a CLI server */
+export interface CliToolDefinition {
+  /** Tool name (used as the MCP tool name) */
+  name: string;
+  /** Human-readable description */
+  description: string;
+  /** 
+   * Command-line arguments template. Use {{paramName}} for parameter placeholders.
+   * Example: ["search", "{{query}}", "--json"]
+   */
+  args: string[];
+  /**
+   * JSON Schema describing the tool's input parameters.
+   * Each property corresponds to a {{placeholder}} in the args template.
+   */
+  inputSchema?: Record<string, unknown>;
+  /** Timeout in ms for this specific tool (overrides server default) */
+  timeoutMs?: number;
+  /** Working directory override for this specific tool */
+  cwd?: string;
+}
+
+/** CLI tool server — wraps a CLI binary and exposes subcommands as MCP tools */
+export interface CliServerConfig extends BaseServerConfig {
+  transport: "cli";
+  /** Path to the CLI binary */
+  command: string;
+  /** Environment variables for all tool executions */
+  env?: Record<string, string>;
+  /** Default working directory for tool executions */
+  cwd?: string;
+  /** Default timeout in ms for tool executions (default: 30000) */
+  timeoutMs?: number;
+  /**
+   * Tool definitions — each becomes an MCP tool.
+   * If omitted or empty, tools are auto-discovered by running `<command> --help`
+   * and parsing the output for subcommands and their flags.
+   */
+  tools?: CliToolDefinition[];
+  /**
+   * Global flags appended to every tool invocation (e.g., ["--json"]).
+   * Discovered automatically from the CLI's global flags section when using auto-discovery.
+   */
+  globalArgs?: string[];
+}
+
+export type ServerConfig = LocalServerConfig | RemoteServerConfig | CliServerConfig;
 
 // ─── Helper Functions ──────────────────────────────────────────────────────────
 
@@ -350,9 +396,23 @@ export interface CreateRemoteServerRequest {
   enabled?: boolean;
 }
 
+export interface CreateCliServerRequest {
+  name: string;
+  command: string;
+  env?: Record<string, string>;
+  cwd?: string;
+  timeoutMs?: number;
+  /** Tool definitions. If omitted or empty, tools are auto-discovered on connect. */
+  tools?: CliToolDefinition[];
+  /** Global flags appended to every tool invocation (e.g., ["--json"]) */
+  globalArgs?: string[];
+  enabled?: boolean;
+}
+
 export type CreateServerRequest =
   | (CreateLocalServerRequest & { transport: "stdio" })
-  | CreateRemoteServerRequest;
+  | CreateRemoteServerRequest
+  | (CreateCliServerRequest & { transport: "cli" });
 
 export interface UpdateServerRequest {
   name?: string;
@@ -367,6 +427,12 @@ export interface UpdateServerRequest {
   auth?: AuthConfig | null;
   /** @deprecated Use `auth` instead */
   oauth?: OAuthConfig | null;
+  /** CLI tool definitions (for cli transport servers) */
+  tools?: CliToolDefinition[];
+  /** Global flags appended to every CLI tool invocation */
+  globalArgs?: string[];
+  /** Default timeout in ms for CLI tool executions */
+  timeoutMs?: number;
 }
 
 export interface ApiResponse<T = unknown> {

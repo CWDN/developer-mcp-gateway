@@ -170,8 +170,25 @@ function compactInputSchema(
     const prop = value as Record<string, unknown>;
     const compactProp: Record<string, unknown> = {};
 
-    // Always keep type
-    if (prop.type) compactProp.type = prop.type;
+    // Normalize type — OpenAI rejects type-union arrays like ["string", "array"].
+    // Convert to a single type that OpenAI understands.
+    if (prop.type) {
+      if (Array.isArray(prop.type)) {
+        const types = (prop.type as string[]).filter((t) => t !== "null");
+        if (types.includes("array")) {
+          // Prefer "array" when it's one of the options (e.g. ["string", "array"])
+          compactProp.type = "array";
+          // Ensure items is set — derive from original or default to string
+          if (!prop.items) {
+            compactProp.items = { type: "string" };
+          }
+        } else {
+          compactProp.type = types.length === 1 ? types[0] : types[0] ?? "string";
+        }
+      } else {
+        compactProp.type = prop.type;
+      }
+    }
 
     // Keep enums - critical for valid values
     if (prop.enum) compactProp.enum = prop.enum;
@@ -203,7 +220,7 @@ function compactInputSchema(
       compactProp.description = compactProp.description ?? "(nested object)";
     }
 
-    // Handle oneOf/anyOf/allOf - simplify to just indicate multiple options
+    // Handle oneOf/anyOf/allOf - simplify to a single type for OpenAI compatibility
     if (prop.oneOf || prop.anyOf || prop.allOf) {
       const variants = (prop.oneOf ?? prop.anyOf ?? prop.allOf) as unknown[];
       if (Array.isArray(variants) && variants.length > 0) {
@@ -211,9 +228,18 @@ function compactInputSchema(
         const types = variants
           .filter((v): v is Record<string, unknown> => typeof v === "object" && v !== null)
           .map((v) => v.type)
-          .filter(Boolean);
+          .filter(Boolean) as string[];
         if (types.length > 0) {
-          compactProp.type = types.length === 1 ? types[0] : types;
+          // Normalize to single type — OpenAI rejects type arrays
+          const nonNull = types.filter((t) => t !== "null");
+          if (nonNull.includes("array")) {
+            compactProp.type = "array";
+            if (!compactProp.items) {
+              compactProp.items = { type: "string" };
+            }
+          } else {
+            compactProp.type = nonNull[0] ?? types[0] ?? "string";
+          }
         }
       }
     }
@@ -223,6 +249,11 @@ function compactInputSchema(
       compactProp.additionalProperties = typeof prop.additionalProperties === "boolean" 
         ? prop.additionalProperties 
         : true;
+    }
+
+    // Ensure 'items' is present whenever type is "array" (OpenAI requirement)
+    if (compactProp.type === "array" && !compactProp.items) {
+      compactProp.items = { type: "string" };
     }
 
     compactProps[key] = compactProp;
