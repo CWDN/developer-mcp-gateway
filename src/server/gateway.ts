@@ -462,11 +462,33 @@ export class Gateway extends EventEmitter {
     };
 
     transport.onerror = (error) => {
-      console.error(
-        `[Gateway] Local server "${config.name}" transport error:`,
-        error
-      );
+      const isTransient = this.isTransientError(error);
+      if (!isTransient) {
+        console.error(
+          `[Gateway] Local server "${config.name}" transport error:`,
+          error
+        );
+      }
       this.setStatus(managed, "error", String(error));
+
+      // If the error is transient, the server process might have died or the connection
+      // dropped. Schedule a reconnect so it recovers automatically.
+      if (
+        !this.shutdownRequested &&
+        config.enabled &&
+        isTransient &&
+        !managed.reconnectTimer
+      ) {
+        console.log(
+          `[Gateway] Transient transport error for "${config.name}" — scheduling reconnect…`
+        );
+        this.emitEvent({
+          type: "server:disconnected",
+          serverId: config.id,
+          error: String(error),
+        });
+        this.scheduleReconnect(managed);
+      }
     };
 
     await client.connect(transport);
@@ -750,11 +772,34 @@ export class Gateway extends EventEmitter {
     };
 
     transport.onerror = (error) => {
-      console.error(
-        `[Gateway] Remote server "${config.name}" transport error:`,
-        error
-      );
+      const isTransient = this.isTransientError(error);
+      if (!isTransient) {
+        console.error(
+          `[Gateway] Remote server "${config.name}" transport error:`,
+          error
+        );
+      }
       this.setStatus(managed, "error", String(error));
+
+      // If the error is transient (e.g. "SSE stream disconnected: TypeError: terminated"),
+      // onclose may never fire, leaving the server stuck in "error" state.
+      // Schedule a reconnect so it recovers automatically.
+      if (
+        !this.shutdownRequested &&
+        config.enabled &&
+        isTransient &&
+        !managed.reconnectTimer
+      ) {
+        console.log(
+          `[Gateway] Transient transport error for "${config.name}" — scheduling reconnect…`
+        );
+        this.emitEvent({
+          type: "server:disconnected",
+          serverId: config.id,
+          error: String(error),
+        });
+        this.scheduleReconnect(managed);
+      }
     };
 
     try {
